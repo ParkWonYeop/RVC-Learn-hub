@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rvc-manager-api"
+version = "0.1.0"
+description = "Central Manager API for RVC Training Orchestrator"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "alembic>=1.15,<2",
+  "aiosqlite>=0.20,<1",
+  "asyncpg>=0.30,<1",
+  "boto3>=1.43.46,<2",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "pydantic-settings>=2.7,<3",
+  "pwdlib[argon2]>=0.2.1,<1",
+  "PyJWT>=2.10,<3",
+  "redis>=5.2,<7",
+  "rq==2.6.1",
+  "rvc-orchestrator-contracts==0.1.0",
+  "sqlalchemy[asyncio]>=2.0.36,<3",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+]
+
+[project.scripts]
+rvc-manager-api = "rvc_manager_api.main:run"
+rvc-manager-bootstrap-admin = "rvc_manager_api.bootstrap:main"
+rvc-manager-rq-worker = "rvc_manager_api.rq_worker:main"
+rvc-manager-adopt-storage-sessions = "rvc_manager_api.storage_adoption:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rvc_manager_api"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
