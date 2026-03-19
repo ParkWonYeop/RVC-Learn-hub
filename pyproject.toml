@@ -1,0 +1,51 @@
+[tool.pytest.ini_options]
+testpaths = [
+  "packages/contracts/tests",
+  "apps/api/tests",
+  "apps/worker/tests",
+  "tests",
+]
+asyncio_mode = "auto"
+addopts = "-q"
+markers = [
+  "e2e: binds a localhost HTTP server and exercises the real Manager/Worker protocol",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = [
+  "packages/contracts/src",
+  "apps/api/src",
+  "apps/worker/src",
+]
+exclude = [".venv", "**/.venv", "**/alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+  "rvc_orchestrator_contracts",
+  "rvc_manager_api",
+  "rvc_worker",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+pretty = true
+show_error_codes = true
+warn_unreachable = true
+exclude = [
+  "(^|/)(tests|alembic/versions)/",
+]
+mypy_path = [
+  "packages/contracts/src",
+  "apps/api/src",
+  "apps/worker/src",
+]
+
+[[tool.mypy.overrides]]
+module = ["yaml", "redis.*"]
+ignore_missing_imports = true
