@@ -1,0 +1,6 @@
+-e packages/contracts[test]
+-e apps/api[test]
+-e apps/worker
+mypy>=1.15,<2
+ruff>=0.11,<1
+
