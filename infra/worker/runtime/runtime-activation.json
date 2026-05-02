@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "gpu_smoke_verified": false,
+  "kind": "rvc-runtime-activation",
+  "native_sample_inference_verified": false,
+  "profile_stage_set_verified": false,
+  "qualification_evidence_sha256": null,
+  "runtime_asset_manifest_sha256": null,
+  "runtime_image_digest": null,
+  "supported_inference_f0_methods": []
+}
