@@ -1,0 +1,87 @@
+upstream manager_api {
+    server ${API_UPSTREAM};
+    keepalive 32;
+}
+
+upstream manager_web {
+    server ${WEB_UPSTREAM};
+    keepalive 32;
+}
+
+server {
+    listen 80 default_server;
+    server_name ${PUBLIC_SERVER_NAME};
+    client_max_body_size ${CLIENT_MAX_BODY_SIZE};
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+    add_header Permissions-Policy "camera=(), geolocation=(), microphone=()" always;
+    # Emit exactly one edge-owned value even when an upstream also applies its
+    # direct-deployment HSTS policy.
+    proxy_hide_header Strict-Transport-Security;
+    add_header Strict-Transport-Security "${PUBLIC_HSTS_HEADER}" always;
+
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 'ok\n';
+    }
+
+    # Liveness above only proves that Nginx is accepting connections.  Load
+    # balancers must use this endpoint before sending application traffic so
+    # PostgreSQL/Redis readiness failures drain the Manager from service.
+    location = /readyz {
+        access_log off;
+        proxy_pass http://manager_api/ready;
+        proxy_http_version 1.1;
+        proxy_connect_timeout 3s;
+        proxy_read_timeout 3s;
+    }
+
+    location /api/ {
+        proxy_pass http://manager_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto ${PUBLIC_SCHEME};
+        proxy_set_header X-Request-ID $request_id;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+
+    # Sample registration is JSON metadata, never an audio upload. Keep this
+    # regex above the generic API prefix so duplicate-key/chunked bodies cannot
+    # consume the application parser's large-upload allowance.
+    location ~ ^/api/v1/workers/jobs/[^/]+/samples$ {
+        client_max_body_size 64k;
+        proxy_pass http://manager_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto ${PUBLIC_SCHEME};
+        proxy_set_header X-Request-ID $request_id;
+        proxy_read_timeout 2m;
+        proxy_send_timeout 2m;
+    }
+
+    location / {
+        proxy_pass http://manager_web;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto ${PUBLIC_SCHEME};
+        proxy_set_header X-Request-ID $request_id;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+}
