@@ -1,0 +1,17 @@
+# This is a minimal syntax example, not a complete runnable stage profile.
+# Real RVC execution remains disabled until every enabled stage has been
+# reviewed and an operator changes RVC_RUNNER_MODE from `fake` to `profile`.
+profile_id: rvc-webui-7ef1986-minimal-example
+repository_root: /opt/rvc-webui
+expected_commit_hash: 7ef19867780cf703841ebafb565a4e47d1ea86ff
+commands:
+  preprocessing:
+    argv:
+      - /opt/rvc-python/bin/python
+      - "{repository}/infer/modules/train/preprocess.py"
+      - "{flat_dataset}"
+      - "{sample_rate_hz}"
+      - "2"
+      - "{rvc_logs}"
+      - "False"
+      - "3.7"
