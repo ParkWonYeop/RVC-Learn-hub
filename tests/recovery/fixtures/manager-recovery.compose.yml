@@ -1,0 +1,258 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rvc_orchestrator}
+      POSTGRES_USER: ${POSTGRES_USER:-rvc_manager}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      MLFLOW_POSTGRES_DB: ${MLFLOW_POSTGRES_DB:-rvc_mlflow}
+      MLFLOW_POSTGRES_USER: ${MLFLOW_POSTGRES_USER:-rvc_mlflow}
+      MLFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/mlflow_postgres_password
+    secrets:
+      - postgres_password
+      - mlflow_postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ${RVC_RECOVERY_DRILL_REPO_ROOT:?repo root is required}/infra/postgres/init/10-create-mlflow-db.sh:/docker-entrypoint-initdb.d/10-create-mlflow-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    entrypoint: ["/opt/rvc/minio-entrypoint.sh"]
+    command: ["server", "/data"]
+    secrets:
+      - minio_root_user
+      - minio_root_password
+    volumes:
+      - minio_data:/data
+      - ${RVC_RECOVERY_DRILL_REPO_ROOT:?repo root is required}/infra/minio/entrypoint.sh:/opt/rvc/minio-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+  minio-init:
+    image: ${MINIO_CLIENT_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}
+    entrypoint: ["/opt/rvc/minio-init.sh"]
+    environment:
+      S3_BUCKET: ${S3_BUCKET:-rvc-orchestrator}
+      MLFLOW_S3_BUCKET: ${MLFLOW_S3_BUCKET:-rvc-mlflow}
+      MAINTENANCE_S3_ACCESS_KEY_FILE: /run/secrets/maintenance_s3_access_key
+      MAINTENANCE_S3_SECRET_KEY_FILE: /run/secrets/maintenance_s3_secret_key
+    secrets:
+      - minio_root_user
+      - minio_root_password
+      - minio_app_access_key
+      - minio_app_secret_key
+      - maintenance_s3_access_key
+      - maintenance_s3_secret_key
+      - mlflow_s3_access_key
+      - mlflow_s3_secret_key
+    volumes:
+      - ${RVC_RECOVERY_DRILL_REPO_ROOT:?repo root is required}/infra/minio/init.sh:/opt/rvc/minio-init.sh:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+  object-recovery:
+    image: ${RVC_RECOVERY_DRILL_API_IMAGE:-rvc-orchestrator-api:recovery-drill}
+    profiles: ["recovery"]
+    user: "0:0"
+    entrypoint: ["python", "/opt/rvc/recovery-object-snapshot.py"]
+    secrets:
+      - minio_root_user
+      - minio_root_password
+    volumes:
+      - ${RVC_RECOVERY_DRILL_REPO_ROOT:?repo root is required}/infra/runtime/recovery_object_snapshot.py:/opt/rvc/recovery-object-snapshot.py:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4-alpine}
+    entrypoint: ["/opt/rvc/redis-entrypoint.sh"]
+    environment:
+      MAINTENANCE_REDIS_USER: rvc_maintenance
+      MAINTENANCE_REDIS_PASSWORD_FILE: /run/secrets/maintenance_redis_password
+      RQ_QUEUE_NAME: rvc-maintenance
+    secrets:
+      - redis_password
+      - maintenance_redis_password
+    volumes:
+      - redis_data:/data
+      - ${RVC_RECOVERY_DRILL_REPO_ROOT:?repo root is required}/infra/redis/entrypoint.sh:/opt/rvc/redis-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$(cat /run/secrets/redis_password) redis-cli --no-auth-warning ping | grep -q PONG"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+  artifact-spool-init:
+    image: ${RVC_RECOVERY_DRILL_API_IMAGE:-rvc-orchestrator-api:recovery-drill}
+    user: "0:0"
+    entrypoint: ["/usr/bin/install"]
+    command: ["-d", "-m", "0700", "/var/lib/rvc-artifact-spool/verify"]
+    volumes:
+      - artifact_spool:/var/lib/rvc-artifact-spool
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+  dataset-ingestion-init:
+    image: ${RVC_RECOVERY_DRILL_API_IMAGE:-rvc-orchestrator-api:recovery-drill}
+    user: "0:0"
+    entrypoint: ["/usr/bin/install"]
+    command: ["-d", "-m", "0700", "/var/lib/rvc-dataset-ingestion"]
+    volumes:
+      - dataset_ingestion:/var/lib/rvc-dataset-ingestion
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+  api-migrate:
+    image: ${RVC_RECOVERY_DRILL_PYTHON_IMAGE:-python:3.11-slim-bookworm}
+    entrypoint: ["/opt/rvc/recovery-api-entrypoint.sh"]
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    volumes:
+      - ${RVC_RECOVERY_DRILL_FIXTURE_ROOT:?fixture root is required}/api-entrypoint.sh:/opt/rvc/recovery-api-entrypoint.sh:ro
+      - ${RVC_RECOVERY_DRILL_FIXTURE_ROOT:?fixture root is required}/alembic:/usr/local/bin/alembic:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+  api:
+    image: ${RVC_RECOVERY_DRILL_PYTHON_IMAGE:-python:3.11-slim-bookworm}
+    entrypoint: ["/opt/rvc/recovery-api-entrypoint.sh"]
+    command: ["serve"]
+    volumes:
+      - ${RVC_RECOVERY_DRILL_FIXTURE_ROOT:?fixture root is required}/api-entrypoint.sh:/opt/rvc/recovery-api-entrypoint.sh:ro
+      - ${RVC_RECOVERY_DRILL_FIXTURE_ROOT:?fixture root is required}/alembic:/usr/local/bin/alembic:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+  mlflow:
+    image: ${RVC_RECOVERY_DRILL_PYTHON_IMAGE:-python:3.11-slim-bookworm}
+    entrypoint: ["/opt/rvc/recovery-api-entrypoint.sh"]
+    command: ["serve-mlflow"]
+    volumes:
+      - ${RVC_RECOVERY_DRILL_FIXTURE_ROOT:?fixture root is required}/api-entrypoint.sh:/opt/rvc/recovery-api-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+  web:
+    image: ${RVC_RECOVERY_DRILL_PYTHON_IMAGE:-python:3.11-slim-bookworm}
+    entrypoint: ["/opt/rvc/recovery-api-entrypoint.sh"]
+    command: ["serve-web"]
+    volumes:
+      - ${RVC_RECOVERY_DRILL_FIXTURE_ROOT:?fixture root is required}/api-entrypoint.sh:/opt/rvc/recovery-api-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+  proxy:
+    image: ${RVC_RECOVERY_DRILL_PYTHON_IMAGE:-python:3.11-slim-bookworm}
+    entrypoint: ["/opt/rvc/recovery-api-entrypoint.sh"]
+    command: ["serve-proxy"]
+    volumes:
+      - ${RVC_RECOVERY_DRILL_FIXTURE_ROOT:?fixture root is required}/api-entrypoint.sh:/opt/rvc/recovery-api-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost/healthz', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+
+secrets:
+  postgres_password:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/postgres_password
+  maintenance_postgres_password:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/maintenance_postgres_password
+  mlflow_postgres_password:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/mlflow_postgres_password
+  minio_root_user:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/minio_root_user
+  minio_root_password:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/minio_root_password
+  redis_password:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/redis_password
+  maintenance_redis_password:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/maintenance_redis_password
+  minio_app_access_key:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/minio_app_access_key
+  minio_app_secret_key:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/minio_app_secret_key
+  maintenance_s3_access_key:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/maintenance_s3_access_key
+  maintenance_s3_secret_key:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/maintenance_s3_secret_key
+  mlflow_s3_access_key:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/mlflow_s3_access_key
+  mlflow_s3_secret_key:
+    file: ${MANAGER_SECRETS_DIR:?Manager secrets directory is required}/mlflow_s3_secret_key
+
+volumes:
+  postgres_data:
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+  minio_data:
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+  redis_data:
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+  artifact_spool:
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
+  dataset_ingestion:
+    labels:
+      org.rvc-orchestrator.test-scope: manager-recovery-drill
+      org.rvc-orchestrator.test-project: ${RVC_RECOVERY_DRILL_PROJECT:?project is required}
