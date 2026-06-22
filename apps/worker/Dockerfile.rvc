@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1.7
+ARG RVC_BASE_IMAGE=offline-rvc-base-image-must-be-provided
+FROM ${RVC_BASE_IMAGE}
+
+ARG RVC_BASE_IMAGE_REF
+ARG RVC_SOURCE_MANIFEST_SHA256
+ARG RVC_WHEELHOUSE_MANIFEST_SHA256
+ARG RVC_ASSET_MANIFEST_SHA256
+ARG RVC_PROJECTION_MANIFEST_SHA256
+ARG RVC_FAIRSEQ_COMMIT
+ARG RVC_RELEASE_VERSION=dev
+ARG RVC_SOURCE_COMMIT=uncommitted
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_NO_INDEX=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DATA_ROOT=/var/lib/rvc-worker \
+    RVC_RUNNER_MODE=native \
+    RVC_NATIVE_SOURCE_ROOT=/opt/rvc-webui \
+    RVC_NATIVE_PYTHON_EXECUTABLE=/opt/conda/bin/python \
+    RVC_NATIVE_CPU_WORKERS=2 \
+    RVC_NATIVE_DEVICE=cuda \
+    RVC_NATIVE_USE_HALF=true \
+    RVC_GPU_SMOKE_VERIFIED=false \
+    RVC_PROFILE_STAGE_SET_VERIFIED=false \
+    RVC_NATIVE_UNVERIFIED_GPU_ACKNOWLEDGED=false \
+    PYTHONPATH=/opt/rvc-webui
+
+USER root
+WORKDIR /opt/build
+COPY wheelhouse /opt/build/wheelhouse
+RUN python -m pip install \
+      --no-index \
+      --find-links=/opt/build/wheelhouse \
+      --require-hashes \
+      --only-binary=:all: \
+      --no-compile \
+      --requirement /opt/build/wheelhouse/requirements.lock
+
+COPY packages/contracts /opt/build/packages/contracts
+COPY apps/worker /opt/build/apps/worker
+RUN python -m pip wheel \
+      --no-index \
+      --no-deps \
+      --no-build-isolation \
+      --wheel-dir /opt/build/agent-wheels \
+      /opt/build/packages/contracts \
+      /opt/build/apps/worker \
+    && python -m pip install \
+      --no-index \
+      --no-deps \
+      --no-compile \
+      /opt/build/agent-wheels/*.whl \
+    && python -c \
+      "import httpx, pydantic, rvc_orchestrator_contracts, rvc_worker, yaml"
+
+COPY rvc-webui /opt/rvc-webui
+COPY runtime /opt/rvc-runtime
+COPY manifests /opt/rvc-runtime/manifests
+RUN chmod 0755 \
+      /opt/rvc-runtime/runtime-entrypoint.sh \
+      /opt/rvc-runtime/runtime_preflight.py \
+      /opt/rvc-runtime/verify_inputs.py \
+      /opt/rvc-runtime/git-pin-shim.sh \
+      /opt/rvc-webui/runtime/bin/ffmpeg \
+      /opt/rvc-webui/runtime/bin/ffprobe \
+    && ln -s /opt/rvc-runtime/git-pin-shim.sh /usr/local/bin/git \
+    && ln -s /opt/rvc-webui/runtime/bin/ffmpeg /usr/local/bin/ffmpeg \
+    && ln -s /opt/rvc-webui/runtime/bin/ffprobe /usr/local/bin/ffprobe \
+    && python /opt/rvc-runtime/runtime_preflight.py \
+      --allow-no-gpu \
+      --asset-manifest /opt/rvc-webui/assets-manifest.json
+
+RUN groupadd --gid 10001 rvc-worker \
+    && useradd --uid 10001 --gid 10001 --home-dir /var/lib/rvc-worker rvc-worker \
+    && install -d -o rvc-worker -g rvc-worker -m 0700 /var/lib/rvc-worker \
+    && install -d -o rvc-worker -g rvc-worker -m 0750 /opt/rvc-webui/assets/weights \
+    && chmod -R go-w /opt/rvc-webui/logs
+
+LABEL org.opencontainers.image.title="RVC Orchestrator Worker real runtime" \
+      org.opencontainers.image.version="${RVC_RELEASE_VERSION}" \
+      org.opencontainers.image.revision="${RVC_SOURCE_COMMIT}" \
+      org.rvc-orchestrator.runtime="rvc" \
+      org.rvc-orchestrator.rvc.commit="7ef19867780cf703841ebafb565a4e47d1ea86ff" \
+      org.rvc-orchestrator.rvc.python="3.11" \
+      org.rvc-orchestrator.rvc.torch="2.6.0+cu124" \
+      org.rvc-orchestrator.rvc.cuda="12.4" \
+      org.rvc-orchestrator.rvc.cudnn="9" \
+      org.rvc-orchestrator.rvc.base="${RVC_BASE_IMAGE_REF}" \
+      org.rvc-orchestrator.rvc.source.sha256="${RVC_SOURCE_MANIFEST_SHA256}" \
+      org.rvc-orchestrator.rvc.wheelhouse.sha256="${RVC_WHEELHOUSE_MANIFEST_SHA256}" \
+      org.rvc-orchestrator.rvc.assets.sha256="${RVC_ASSET_MANIFEST_SHA256}" \
+      org.rvc-orchestrator.rvc.projection.sha256="${RVC_PROJECTION_MANIFEST_SHA256}" \
+      org.rvc-orchestrator.rvc.fairseq.commit="${RVC_FAIRSEQ_COMMIT}" \
+      org.rvc-orchestrator.gpu-smoke-verified="false" \
+      org.rvc-orchestrator.profile-stage-set-verified="false"
+
+USER 10001:10001
+WORKDIR /var/lib/rvc-worker
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD ["python", "-m", "rvc_worker", "--check"]
+
+ENTRYPOINT ["/opt/rvc-runtime/runtime-entrypoint.sh"]
