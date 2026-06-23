@@ -1,0 +1,8 @@
+services:
+  worker:
+    build:
+      context: ../..
+      dockerfile: apps/worker/Dockerfile
+      args:
+        RVC_RELEASE_VERSION: ${ORCHESTRATOR_VERSION:-dev}
+        RVC_SOURCE_COMMIT: ${GIT_COMMIT:-uncommitted}

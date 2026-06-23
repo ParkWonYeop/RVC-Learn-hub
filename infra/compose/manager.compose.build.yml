@@ -1,0 +1,30 @@
+services:
+  mlflow:
+    build:
+      context: ../..
+      dockerfile: infra/mlflow/Dockerfile
+      args:
+        MLFLOW_BASE_IMAGE: ${MLFLOW_BASE_IMAGE:-ghcr.io/mlflow/mlflow:v3.1.1}
+        RVC_RELEASE_VERSION: ${ORCHESTRATOR_VERSION:-dev}
+        RVC_SOURCE_COMMIT: ${GIT_COMMIT:-uncommitted}
+  api:
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+      args:
+        RVC_RELEASE_VERSION: ${ORCHESTRATOR_VERSION:-dev}
+        RVC_SOURCE_COMMIT: ${GIT_COMMIT:-uncommitted}
+  api-migrate:
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+      args:
+        RVC_RELEASE_VERSION: ${ORCHESTRATOR_VERSION:-dev}
+        RVC_SOURCE_COMMIT: ${GIT_COMMIT:-uncommitted}
+  web:
+    build:
+      context: ../..
+      dockerfile: apps/web/Dockerfile
+      args:
+        RVC_RELEASE_VERSION: ${ORCHESTRATOR_VERSION:-dev}
+        RVC_SOURCE_COMMIT: ${GIT_COMMIT:-uncommitted}
