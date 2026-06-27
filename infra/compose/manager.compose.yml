@@ -1,0 +1,676 @@
+name: ${COMPOSE_PROJECT_NAME:-rvc-orchestrator-manager}
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  postgres:
+    <<: *service-defaults
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rvc_orchestrator}
+      POSTGRES_USER: ${POSTGRES_USER:-rvc_manager}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      MLFLOW_POSTGRES_DB: ${MLFLOW_POSTGRES_DB:-rvc_mlflow}
+      MLFLOW_POSTGRES_USER: ${MLFLOW_POSTGRES_USER:-rvc_mlflow}
+      MLFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/mlflow_postgres_password
+      TZ: ${TZ:-UTC}
+    secrets:
+      - postgres_password
+      - mlflow_postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../postgres/init/10-create-mlflow-db.sh:/docker-entrypoint-initdb.d/10-create-mlflow-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - storage
+
+  redis:
+    <<: *service-defaults
+    image: ${REDIS_IMAGE:-redis:7.4-alpine}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    entrypoint: ["/opt/rvc/redis-entrypoint.sh"]
+    environment:
+      MAINTENANCE_REDIS_USER: ${MAINTENANCE_REDIS_USER:-rvc_maintenance}
+      MAINTENANCE_REDIS_PASSWORD_FILE: /run/secrets/maintenance_redis_password
+      RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:-rvc-maintenance}
+    secrets:
+      - redis_password
+      - maintenance_redis_password
+    volumes:
+      - redis_data:/data
+      - ../redis/entrypoint.sh:/opt/rvc/redis-entrypoint.sh:ro
+      - ../redis/healthcheck.sh:/opt/rvc/redis-healthcheck.sh:ro
+    healthcheck:
+      test: ["CMD", "/opt/rvc/redis-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - storage
+
+  minio:
+    <<: *service-defaults
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    entrypoint: ["/opt/rvc/minio-entrypoint.sh"]
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_BROWSER_REDIRECT_URL: http://${MINIO_CONSOLE_BIND_ADDRESS:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}
+      MINIO_API_CORS_ALLOW_ORIGIN: ${CORS_ORIGINS:-http://localhost:8080}
+      MINIO_API_CORS_ALLOW_CREDENTIALS_WITH_WILDCARD: "off"
+    secrets:
+      - minio_root_user
+      - minio_root_password
+    volumes:
+      - minio_data:/data
+      - ../minio/entrypoint.sh:/opt/rvc/minio-entrypoint.sh:ro
+    ports:
+      - ${MINIO_API_BIND_ADDRESS:-127.0.0.1}:${MINIO_API_PORT:-9000}:9000
+      - ${MINIO_CONSOLE_BIND_ADDRESS:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - storage
+      - host-access
+
+  minio-init:
+    image: ${MINIO_CLIENT_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    restart: "no"
+    entrypoint: ["/opt/rvc/minio-init.sh"]
+    environment:
+      S3_BUCKET: ${S3_BUCKET:-rvc-orchestrator}
+      MLFLOW_S3_BUCKET: ${MLFLOW_S3_BUCKET:-rvc-mlflow}
+      MAINTENANCE_S3_ACCESS_KEY_FILE: /run/secrets/maintenance_s3_access_key
+      MAINTENANCE_S3_SECRET_KEY_FILE: /run/secrets/maintenance_s3_secret_key
+    secrets:
+      - minio_root_user
+      - minio_root_password
+      - minio_app_access_key
+      - minio_app_secret_key
+      - maintenance_s3_access_key
+      - maintenance_s3_secret_key
+      - mlflow_s3_access_key
+      - mlflow_s3_secret_key
+    volumes:
+      - ../minio/init.sh:/opt/rvc/minio-init.sh:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - storage
+
+  object-recovery:
+    image: ${API_IMAGE:-rvc-orchestrator-api:dev}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    profiles: ["recovery"]
+    restart: "no"
+    init: true
+    user: "0:0"
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["python", "/opt/rvc/recovery-object-snapshot.py"]
+    secrets:
+      - minio_root_user
+      - minio_root_password
+    volumes:
+      - ../runtime/recovery_object_snapshot.py:/opt/rvc/recovery-object-snapshot.py:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - storage
+
+  artifact-spool-init:
+    image: ${API_IMAGE:-rvc-orchestrator-api:dev}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    restart: "no"
+    init: true
+    user: "0:0"
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["/usr/bin/install"]
+    command: ["-d", "-o", "rvc", "-g", "rvc", "-m", "0700", "/var/lib/rvc-artifact-spool/verify"]
+    volumes:
+      - artifact_spool:/var/lib/rvc-artifact-spool
+    network_mode: none
+
+  dataset-ingestion-init:
+    image: ${API_IMAGE:-rvc-orchestrator-api:dev}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    restart: "no"
+    init: true
+    user: "0:0"
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["/usr/bin/install"]
+    command: ["-d", "-o", "rvc", "-g", "rvc", "-m", "0700", "/var/lib/rvc-dataset-ingestion"]
+    volumes:
+      - dataset_ingestion:/var/lib/rvc-dataset-ingestion
+    network_mode: none
+
+  manager-secrets-init:
+    image: ${API_IMAGE:-rvc-orchestrator-api:dev}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    restart: "no"
+    init: true
+    user: "0:0"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    pids_limit: 32
+    entrypoint: ["python", "/opt/rvc/manager-secrets-init.py"]
+    secrets:
+      - postgres_password
+      - redis_password
+      - minio_app_access_key
+      - minio_app_secret_key
+      - maintenance_postgres_password
+      - maintenance_redis_password
+      - maintenance_s3_access_key
+      - maintenance_s3_secret_key
+      - worker_bootstrap_token
+      - worker_token_pepper
+      - jwt_secret
+      - mlflow_postgres_password
+      - mlflow_s3_access_key
+      - mlflow_s3_secret_key
+    volumes:
+      - ../runtime/manager-secrets-init.py:/opt/rvc/manager-secrets-init.py:ro
+      - api_runtime_secrets:/prepared/api
+      - maintenance_runtime_secrets:/prepared/maintenance
+      - mlflow_runtime_secrets:/prepared/mlflow
+      - database_authz_runtime_secrets:/prepared/database-authz
+    network_mode: none
+
+  mlflow:
+    <<: *service-defaults
+    image: ${MLFLOW_IMAGE:-rvc-orchestrator-mlflow:dev}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    user: "10002:10002"
+    read_only: true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    entrypoint: ["/opt/rvc/mlflow-entrypoint.sh"]
+    environment:
+      MLFLOW_POSTGRES_DB: ${MLFLOW_POSTGRES_DB:-rvc_mlflow}
+      MLFLOW_POSTGRES_USER: ${MLFLOW_POSTGRES_USER:-rvc_mlflow}
+      MLFLOW_S3_BUCKET: ${MLFLOW_S3_BUCKET:-rvc-mlflow}
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    volumes:
+      - ../mlflow/entrypoint.sh:/opt/rvc/mlflow-entrypoint.sh:ro
+      - mlflow_runtime_secrets:/run/secrets:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=0700,uid=10002,gid=10002
+    ports:
+      - ${MLFLOW_BIND_ADDRESS:-127.0.0.1}:${MLFLOW_PORT:-5000}:5000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      manager-secrets-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - storage
+      - host-access
+
+  api-migrate:
+    image: ${API_IMAGE:-rvc-orchestrator-api:dev}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    restart: "no"
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["/opt/rvc/api-entrypoint.sh"]
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      PROCESS_ROLE: api
+      ALLOW_FAKE_WORKERS: ${ALLOW_FAKE_WORKERS:-false}
+      POSTGRES_DB: ${POSTGRES_DB:-rvc_orchestrator}
+      POSTGRES_USER: ${POSTGRES_USER:-rvc_manager}
+      REDIS_DB: ${REDIS_DB:-0}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-s3}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_PRESIGN_ENDPOINT_URL: ${S3_PRESIGN_ENDPOINT_URL:?S3_PRESIGN_ENDPOINT_URL must be reachable by remote Workers}
+      S3_BUCKET: ${S3_BUCKET:-rvc-orchestrator}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-path}
+      S3_VERIFY_TLS: ${S3_VERIFY_TLS:-true}
+      S3_PRESIGN_BIND_CHECKSUM: ${S3_PRESIGN_BIND_CHECKSUM:-false}
+      ARTIFACT_UPLOAD_TTL_SECONDS: ${ARTIFACT_UPLOAD_TTL_SECONDS:-3600}
+      ARTIFACT_DOWNLOAD_TTL_SECONDS: ${ARTIFACT_DOWNLOAD_TTL_SECONDS:-60}
+      ARTIFACT_MAX_BYTES: ${ARTIFACT_MAX_BYTES:-5368709120}
+      ARTIFACT_STREAM_CHUNK_BYTES: ${ARTIFACT_STREAM_CHUNK_BYTES:-1048576}
+      ARTIFACT_FINALIZING_STALE_SECONDS: ${ARTIFACT_FINALIZING_STALE_SECONDS:-7200}
+      ARTIFACT_RETRY_AFTER_SECONDS: ${ARTIFACT_RETRY_AFTER_SECONDS:-5}
+      ARTIFACT_ATTEMPT_MAX_SESSIONS: ${ARTIFACT_ATTEMPT_MAX_SESSIONS:-256}
+      ARTIFACT_ATTEMPT_MAX_BYTES: ${ARTIFACT_ATTEMPT_MAX_BYTES:-107374182400}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      LEASE_SECONDS: ${LEASE_SECONDS:-120}
+      WORKER_OFFLINE_SECONDS: ${WORKER_OFFLINE_SECONDS:-180}
+      LEASE_RECOVERY_MAX_ATTEMPTS: ${LEASE_RECOVERY_MAX_ATTEMPTS:-3}
+      JWT_SECRET_FILE: /run/secrets/current/jwt_secret
+    volumes:
+      - ../runtime/api-entrypoint.sh:/opt/rvc/api-entrypoint.sh:ro
+      - api_runtime_secrets:/run/secrets:ro
+    depends_on:
+      manager-secrets-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    networks:
+      - storage
+
+  maintenance-db-authz:
+    image: ${API_IMAGE:-rvc-orchestrator-api:dev}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    restart: "no"
+    init: true
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 32
+    entrypoint: ["python", "/opt/rvc/maintenance-db-authz.py", "apply"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-rvc_orchestrator}
+      POSTGRES_USER: ${POSTGRES_USER:-rvc_manager}
+      MAINTENANCE_POSTGRES_USER: ${MAINTENANCE_POSTGRES_USER:-rvc_maintenance}
+      MAINTENANCE_TASK_TIMEOUT_SECONDS: ${MAINTENANCE_TASK_TIMEOUT_SECONDS:-300}
+    volumes:
+      - ../runtime/maintenance-db-authz.py:/opt/rvc/maintenance-db-authz.py:ro
+      - database_authz_runtime_secrets:/run/secrets:ro
+    depends_on:
+      manager-secrets-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      api-migrate:
+        condition: service_completed_successfully
+    networks:
+      - storage
+
+  api:
+    <<: *service-defaults
+    image: ${API_IMAGE:-rvc-orchestrator-api:dev}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    entrypoint: ["/opt/rvc/api-entrypoint.sh"]
+    command: ["uvicorn", "rvc_manager_api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*", "--no-access-log"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      PUBLIC_SCHEME: ${PUBLIC_SCHEME:-http}
+      PROCESS_ROLE: api
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ALLOW_FAKE_WORKERS: ${ALLOW_FAKE_WORKERS:-false}
+      POSTGRES_DB: ${POSTGRES_DB:-rvc_orchestrator}
+      POSTGRES_USER: ${POSTGRES_USER:-rvc_manager}
+      REDIS_DB: ${REDIS_DB:-0}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-s3}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_PRESIGN_ENDPOINT_URL: ${S3_PRESIGN_ENDPOINT_URL:?S3_PRESIGN_ENDPOINT_URL must be reachable by remote Workers}
+      S3_BUCKET: ${S3_BUCKET:-rvc-orchestrator}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-path}
+      S3_VERIFY_TLS: ${S3_VERIFY_TLS:-true}
+      S3_PRESIGN_BIND_CHECKSUM: ${S3_PRESIGN_BIND_CHECKSUM:-false}
+      ARTIFACT_UPLOAD_TTL_SECONDS: ${ARTIFACT_UPLOAD_TTL_SECONDS:-3600}
+      ARTIFACT_DOWNLOAD_TTL_SECONDS: ${ARTIFACT_DOWNLOAD_TTL_SECONDS:-60}
+      ARTIFACT_MAX_BYTES: ${ARTIFACT_MAX_BYTES:-5368709120}
+      ARTIFACT_STREAM_CHUNK_BYTES: ${ARTIFACT_STREAM_CHUNK_BYTES:-1048576}
+      ARTIFACT_FINALIZING_STALE_SECONDS: ${ARTIFACT_FINALIZING_STALE_SECONDS:-7200}
+      ARTIFACT_RETRY_AFTER_SECONDS: ${ARTIFACT_RETRY_AFTER_SECONDS:-5}
+      ARTIFACT_ATTEMPT_MAX_SESSIONS: ${ARTIFACT_ATTEMPT_MAX_SESSIONS:-256}
+      ARTIFACT_ATTEMPT_MAX_BYTES: ${ARTIFACT_ATTEMPT_MAX_BYTES:-107374182400}
+      ARTIFACT_VERIFICATION_SPOOL_DIR: /var/lib/rvc-artifact-spool/verify
+      DATASET_UPLOAD_TTL_SECONDS: ${DATASET_UPLOAD_TTL_SECONDS:-3600}
+      DATASET_DOWNLOAD_TTL_SECONDS: ${DATASET_DOWNLOAD_TTL_SECONDS:-60}
+      DATASET_UPLOAD_MAX_BYTES: ${DATASET_UPLOAD_MAX_BYTES:-5368709120}
+      DATASET_OWNER_MAX_SESSIONS: ${DATASET_OWNER_MAX_SESSIONS:-8}
+      DATASET_OWNER_MAX_BYTES: ${DATASET_OWNER_MAX_BYTES:-21474836480}
+      DATASET_UPLOAD_WRITE_STALE_SECONDS: ${DATASET_UPLOAD_WRITE_STALE_SECONDS:-300}
+      DATASET_UPLOAD_WRITE_HEARTBEAT_SECONDS: ${DATASET_UPLOAD_WRITE_HEARTBEAT_SECONDS:-15}
+      DATASET_FINALIZING_STALE_SECONDS: ${DATASET_FINALIZING_STALE_SECONDS:-1800}
+      DATASET_FINALIZING_HEARTBEAT_SECONDS: ${DATASET_FINALIZING_HEARTBEAT_SECONDS:-30}
+      DATASET_CLEANUP_LATE_WRITER_GRACE_SECONDS: ${DATASET_CLEANUP_LATE_WRITER_GRACE_SECONDS:-7200}
+      DATASET_CLEANUP_CONFIRMATION_GRACE_SECONDS: ${DATASET_CLEANUP_CONFIRMATION_GRACE_SECONDS:-60}
+      DATASET_RETRY_AFTER_SECONDS: ${DATASET_RETRY_AFTER_SECONDS:-5}
+      DATASET_INGESTION_ROOT: /var/lib/rvc-dataset-ingestion
+      DATASET_MAX_ENTRIES: ${DATASET_MAX_ENTRIES:-10000}
+      DATASET_MAX_FILE_UNCOMPRESSED_BYTES: ${DATASET_MAX_FILE_UNCOMPRESSED_BYTES:-2147483648}
+      DATASET_MAX_TOTAL_UNCOMPRESSED_BYTES: ${DATASET_MAX_TOTAL_UNCOMPRESSED_BYTES:-21474836480}
+      DATASET_MAX_COMPRESSION_RATIO: ${DATASET_MAX_COMPRESSION_RATIO:-200}
+      TEST_SET_UPLOAD_TTL_SECONDS: ${TEST_SET_UPLOAD_TTL_SECONDS:-1800}
+      TEST_SET_UPLOAD_WRITE_STALE_SECONDS: ${TEST_SET_UPLOAD_WRITE_STALE_SECONDS:-300}
+      TEST_SET_UPLOAD_WRITE_HEARTBEAT_SECONDS: ${TEST_SET_UPLOAD_WRITE_HEARTBEAT_SECONDS:-15}
+      TEST_SET_FINALIZING_STALE_SECONDS: ${TEST_SET_FINALIZING_STALE_SECONDS:-1800}
+      TEST_SET_FINALIZING_HEARTBEAT_SECONDS: ${TEST_SET_FINALIZING_HEARTBEAT_SECONDS:-30}
+      TEST_SET_CLEANUP_LATE_WRITER_GRACE_SECONDS: ${TEST_SET_CLEANUP_LATE_WRITER_GRACE_SECONDS:-7200}
+      TEST_SET_CLEANUP_CONFIRMATION_GRACE_SECONDS: ${TEST_SET_CLEANUP_CONFIRMATION_GRACE_SECONDS:-60}
+      TEST_SET_ITEM_MAX_BYTES: ${TEST_SET_ITEM_MAX_BYTES:-268435456}
+      TEST_SET_OWNER_MAX_SESSIONS: ${TEST_SET_OWNER_MAX_SESSIONS:-64}
+      TEST_SET_OWNER_MAX_BYTES: ${TEST_SET_OWNER_MAX_BYTES:-2147483648}
+      TEST_SET_MAX_ITEMS: ${TEST_SET_MAX_ITEMS:-128}
+      TEST_SET_MAX_DURATION_SECONDS: ${TEST_SET_MAX_DURATION_SECONDS:-600}
+      TEST_SET_MIN_SAMPLE_RATE_HZ: ${TEST_SET_MIN_SAMPLE_RATE_HZ:-8000}
+      TEST_SET_MAX_SAMPLE_RATE_HZ: ${TEST_SET_MAX_SAMPLE_RATE_HZ:-192000}
+      TEST_SET_MAX_CHANNELS: ${TEST_SET_MAX_CHANNELS:-2}
+      SAMPLE_MAX_BYTES: ${SAMPLE_MAX_BYTES:-268435456}
+      SAMPLE_MAX_DURATION_SECONDS: ${SAMPLE_MAX_DURATION_SECONDS:-600}
+      SAMPLE_MAX_CHANNELS: ${SAMPLE_MAX_CHANNELS:-2}
+      SAMPLE_REGISTRATION_JSON_MAX_BYTES: ${SAMPLE_REGISTRATION_JSON_MAX_BYTES:-65536}
+      EXPERIMENT_JSON_MAX_BYTES: ${EXPERIMENT_JSON_MAX_BYTES:-16384}
+      USER_LIFECYCLE_JSON_MAX_BYTES: ${USER_LIFECYCLE_JSON_MAX_BYTES:-16384}
+      WORKER_TELEMETRY_JSON_MAX_BYTES: ${WORKER_TELEMETRY_JSON_MAX_BYTES:-2097152}
+      SAMPLE_VERIFICATION_TIMEOUT_SECONDS: ${SAMPLE_VERIFICATION_TIMEOUT_SECONDS:-120}
+      SAMPLE_VERIFICATION_MAX_CONCURRENCY: ${SAMPLE_VERIFICATION_MAX_CONCURRENCY:-2}
+      SAMPLE_APPROVED_RUNTIME_BUNDLES: ${SAMPLE_APPROVED_RUNTIME_BUNDLES:-}
+      AUTO_SAMPLE_JOBS_ENABLED: ${AUTO_SAMPLE_JOBS_ENABLED:-false}
+      MLFLOW_ENABLED: ${MLFLOW_ENABLED:-true}
+      MLFLOW_FAIL_CLOSED: ${MLFLOW_FAIL_CLOSED:-false}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_REQUEST_TIMEOUT_SECONDS: ${MLFLOW_REQUEST_TIMEOUT_SECONDS:-5}
+      MLFLOW_READINESS_TIMEOUT_SECONDS: ${MLFLOW_READINESS_TIMEOUT_SECONDS:-1}
+      MLFLOW_SYNC_INTERVAL_SECONDS: ${MLFLOW_SYNC_INTERVAL_SECONDS:-5}
+      MLFLOW_SYNC_BATCH_SIZE: ${MLFLOW_SYNC_BATCH_SIZE:-20}
+      MLFLOW_PROCESSING_STALE_SECONDS: ${MLFLOW_PROCESSING_STALE_SECONDS:-120}
+      MLFLOW_RETRY_MAX_SECONDS: ${MLFLOW_RETRY_MAX_SECONDS:-300}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_FAIL_CLOSED: ${RATE_LIMIT_FAIL_CLOSED:-true}
+      RATE_LIMIT_DEFAULT_REQUESTS_PER_MINUTE: ${RATE_LIMIT_DEFAULT_REQUESTS_PER_MINUTE:-600}
+      RATE_LIMIT_SAMPLE_REQUESTS_PER_MINUTE: ${RATE_LIMIT_SAMPLE_REQUESTS_PER_MINUTE:-30}
+      RATE_LIMIT_SAMPLE_DOWNLOAD_REQUESTS_PER_MINUTE: ${RATE_LIMIT_SAMPLE_DOWNLOAD_REQUESTS_PER_MINUTE:-60}
+      RATE_LIMIT_LOGIN_REQUESTS_PER_MINUTE: ${RATE_LIMIT_LOGIN_REQUESTS_PER_MINUTE:-10}
+      RATE_LIMIT_REGISTER_REQUESTS_PER_MINUTE: ${RATE_LIMIT_REGISTER_REQUESTS_PER_MINUTE:-10}
+      RATE_LIMIT_WORKER_TOKEN_ROTATION_REQUESTS_PER_MINUTE: ${RATE_LIMIT_WORKER_TOKEN_ROTATION_REQUESTS_PER_MINUTE:-6}
+      RATE_LIMIT_UPLOAD_REQUESTS_PER_MINUTE: ${RATE_LIMIT_UPLOAD_REQUESTS_PER_MINUTE:-120}
+      RATE_LIMIT_FINALIZE_REQUESTS_PER_MINUTE: ${RATE_LIMIT_FINALIZE_REQUESTS_PER_MINUTE:-30}
+      WORKER_TOKEN_ROTATION_TTL_SECONDS: ${WORKER_TOKEN_ROTATION_TTL_SECONDS:-600}
+      RQ_ENABLED: ${RQ_ENABLED:-true}
+      RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:-rvc-maintenance}
+      RQ_READINESS_TIMEOUT_SECONDS: ${RQ_READINESS_TIMEOUT_SECONDS:-2}
+      RQ_WORKER_HEARTBEAT_MAX_AGE_SECONDS: ${RQ_WORKER_HEARTBEAT_MAX_AGE_SECONDS:-75}
+      RQ_WORKER_TTL_SECONDS: ${RQ_WORKER_TTL_SECONDS:-45}
+      MAINTENANCE_CLEANUP_GRACE_SECONDS: ${MAINTENANCE_CLEANUP_GRACE_SECONDS:-604800}
+      MAINTENANCE_CLEANUP_BATCH_SIZE: ${MAINTENANCE_CLEANUP_BATCH_SIZE:-250}
+      MAINTENANCE_TASK_TIMEOUT_SECONDS: ${MAINTENANCE_TASK_TIMEOUT_SECONDS:-300}
+      MAINTENANCE_TASK_HEARTBEAT_SECONDS: ${MAINTENANCE_TASK_HEARTBEAT_SECONDS:-15}
+      MAINTENANCE_TASK_MAX_ATTEMPTS: ${MAINTENANCE_TASK_MAX_ATTEMPTS:-3}
+      MAINTENANCE_RETRY_BACKOFF_SECONDS: ${MAINTENANCE_RETRY_BACKOFF_SECONDS:-30}
+      MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS: ${MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS:-300}
+      MAINTENANCE_CLEANUP_CLAIM_STALE_SECONDS: ${MAINTENANCE_CLEANUP_CLAIM_STALE_SECONDS:-900}
+      MAINTENANCE_RECONCILE_ENABLED: ${MAINTENANCE_RECONCILE_ENABLED:-true}
+      MAINTENANCE_RECONCILE_INTERVAL_SECONDS: ${MAINTENANCE_RECONCILE_INTERVAL_SECONDS:-15}
+      MAINTENANCE_RECONCILE_STALE_SECONDS: ${MAINTENANCE_RECONCILE_STALE_SECONDS:-120}
+      MAINTENANCE_RECONCILE_BATCH_SIZE: ${MAINTENANCE_RECONCILE_BATCH_SIZE:-100}
+      LEASE_SECONDS: ${LEASE_SECONDS:-120}
+      WORKER_OFFLINE_SECONDS: ${WORKER_OFFLINE_SECONDS:-180}
+      LEASE_RECOVERY_MAX_ATTEMPTS: ${LEASE_RECOVERY_MAX_ATTEMPTS:-3}
+      JWT_SECRET_FILE: /run/secrets/current/jwt_secret
+      READINESS_CHECK_REDIS: "true"
+      AUTO_CREATE_SCHEMA: "false"
+    volumes:
+      - ../runtime/api-entrypoint.sh:/opt/rvc/api-entrypoint.sh:ro
+      - api_runtime_secrets:/run/secrets:ro
+      - artifact_spool:/var/lib/rvc-artifact-spool
+      - dataset_ingestion:/var/lib/rvc-dataset-ingestion
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      manager-secrets-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      api-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      artifact-spool-init:
+        condition: service_completed_successfully
+      dataset-ingestion-init:
+        condition: service_completed_successfully
+    networks:
+      - backend
+      - storage
+
+  rq-worker:
+    <<: *service-defaults
+    image: ${API_IMAGE:-rvc-orchestrator-api:dev}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    entrypoint: ["/opt/rvc/rq-worker-entrypoint.sh"]
+    command: ["rvc-manager-rq-worker"]
+    read_only: true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      PROCESS_ROLE: maintenance
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      POSTGRES_DB: ${POSTGRES_DB:-rvc_orchestrator}
+      MAINTENANCE_POSTGRES_USER: ${MAINTENANCE_POSTGRES_USER:-rvc_maintenance}
+      MAINTENANCE_REDIS_USER: ${MAINTENANCE_REDIS_USER:-rvc_maintenance}
+      REDIS_DB: ${REDIS_DB:-0}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-s3}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-rvc-orchestrator}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-path}
+      S3_VERIFY_TLS: ${S3_VERIFY_TLS:-true}
+      S3_PRESIGN_BIND_CHECKSUM: ${S3_PRESIGN_BIND_CHECKSUM:-false}
+      MLFLOW_ENABLED: "false"
+      RATE_LIMIT_ENABLED: "false"
+      RQ_ENABLED: "true"
+      RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:-rvc-maintenance}
+      RQ_WORKER_HEARTBEAT_MAX_AGE_SECONDS: ${RQ_WORKER_HEARTBEAT_MAX_AGE_SECONDS:-75}
+      RQ_WORKER_TTL_SECONDS: ${RQ_WORKER_TTL_SECONDS:-45}
+      MAINTENANCE_CLEANUP_GRACE_SECONDS: ${MAINTENANCE_CLEANUP_GRACE_SECONDS:-604800}
+      MAINTENANCE_CLEANUP_BATCH_SIZE: ${MAINTENANCE_CLEANUP_BATCH_SIZE:-250}
+      MAINTENANCE_TASK_TIMEOUT_SECONDS: ${MAINTENANCE_TASK_TIMEOUT_SECONDS:-300}
+      MAINTENANCE_TASK_HEARTBEAT_SECONDS: ${MAINTENANCE_TASK_HEARTBEAT_SECONDS:-15}
+      MAINTENANCE_TASK_MAX_ATTEMPTS: ${MAINTENANCE_TASK_MAX_ATTEMPTS:-3}
+      MAINTENANCE_RETRY_BACKOFF_SECONDS: ${MAINTENANCE_RETRY_BACKOFF_SECONDS:-30}
+      MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS: ${MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS:-300}
+      MAINTENANCE_CLEANUP_CLAIM_STALE_SECONDS: ${MAINTENANCE_CLEANUP_CLAIM_STALE_SECONDS:-900}
+      DATASET_UPLOAD_TTL_SECONDS: ${DATASET_UPLOAD_TTL_SECONDS:-3600}
+      DATASET_UPLOAD_WRITE_STALE_SECONDS: ${DATASET_UPLOAD_WRITE_STALE_SECONDS:-300}
+      DATASET_UPLOAD_WRITE_HEARTBEAT_SECONDS: ${DATASET_UPLOAD_WRITE_HEARTBEAT_SECONDS:-15}
+      DATASET_CLEANUP_LATE_WRITER_GRACE_SECONDS: ${DATASET_CLEANUP_LATE_WRITER_GRACE_SECONDS:-7200}
+      DATASET_CLEANUP_CONFIRMATION_GRACE_SECONDS: ${DATASET_CLEANUP_CONFIRMATION_GRACE_SECONDS:-60}
+      TEST_SET_UPLOAD_TTL_SECONDS: ${TEST_SET_UPLOAD_TTL_SECONDS:-1800}
+      TEST_SET_UPLOAD_WRITE_STALE_SECONDS: ${TEST_SET_UPLOAD_WRITE_STALE_SECONDS:-300}
+      TEST_SET_CLEANUP_LATE_WRITER_GRACE_SECONDS: ${TEST_SET_CLEANUP_LATE_WRITER_GRACE_SECONDS:-7200}
+      TEST_SET_CLEANUP_CONFIRMATION_GRACE_SECONDS: ${TEST_SET_CLEANUP_CONFIRMATION_GRACE_SECONDS:-60}
+    volumes:
+      - ../runtime/rq-worker-entrypoint.sh:/opt/rvc/rq-worker-entrypoint.sh:ro
+      - ../runtime/maintenance-db-authz.py:/opt/rvc/maintenance-db-authz.py:ro
+      - maintenance_runtime_secrets:/run/secrets:ro
+    depends_on:
+      manager-secrets-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      api-migrate:
+        condition: service_completed_successfully
+      maintenance-db-authz:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - storage
+
+  web:
+    <<: *service-defaults
+    image: ${WEB_IMAGE:-rvc-orchestrator-web:dev}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    environment:
+      NODE_ENV: production
+      PUBLIC_SCHEME: ${PUBLIC_SCHEME:-http}
+      API_INTERNAL_URL: http://api:8000
+      DATASET_UPLOAD_ALLOWED_ORIGINS: ${S3_PRESIGN_ENDPOINT_URL:?S3_PRESIGN_ENDPOINT_URL must be reachable by browsers}
+      NEXT_PUBLIC_API_BASE_URL: /api/v1
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - backend
+
+  proxy:
+    <<: *service-defaults
+    image: ${NGINX_IMAGE:-nginx:1.27-alpine}
+    pull_policy: ${RVC_IMAGE_PULL_POLICY:-missing}
+    entrypoint: ["/opt/rvc/proxy-entrypoint.sh"]
+    command: ["nginx", "-g", "daemon off;"]
+    environment:
+      NGINX_ENVSUBST_FILTER: ^(API_UPSTREAM|WEB_UPSTREAM|PUBLIC_SERVER_NAME|PUBLIC_SCHEME|PUBLIC_HSTS_HEADER|CLIENT_MAX_BODY_SIZE)$$
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      API_UPSTREAM: api:8000
+      WEB_UPSTREAM: web:3000
+      PUBLIC_SERVER_NAME: ${PUBLIC_SERVER_NAME:-localhost}
+      PUBLIC_SCHEME: ${PUBLIC_SCHEME:-http}
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-20g}
+    volumes:
+      - ../proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../proxy/templates:/etc/nginx/templates:ro
+      - ../runtime/proxy-entrypoint.sh:/opt/rvc/proxy-entrypoint.sh:ro
+    ports:
+      - ${HTTP_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:80
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    networks:
+      - edge
+      - backend
+
+secrets:
+  postgres_password:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/postgres_password
+  maintenance_postgres_password:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/maintenance_postgres_password
+  mlflow_postgres_password:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/mlflow_postgres_password
+  redis_password:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/redis_password
+  maintenance_redis_password:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/maintenance_redis_password
+  minio_root_user:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/minio_root_user
+  minio_root_password:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/minio_root_password
+  minio_app_access_key:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/minio_app_access_key
+  minio_app_secret_key:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/minio_app_secret_key
+  maintenance_s3_access_key:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/maintenance_s3_access_key
+  maintenance_s3_secret_key:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/maintenance_s3_secret_key
+  mlflow_s3_access_key:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/mlflow_s3_access_key
+  mlflow_s3_secret_key:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/mlflow_s3_secret_key
+  worker_bootstrap_token:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/worker_bootstrap_token
+  worker_token_pepper:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/worker_token_pepper
+  jwt_secret:
+    file: ${MANAGER_SECRETS_DIR:?MANAGER_SECRETS_DIR must be set}/jwt_secret
+
+networks:
+  edge:
+  host-access:
+  backend:
+    internal: true
+  storage:
+    internal: true
+
+volumes:
+  postgres_data:
+    labels:
+      org.rvc-orchestrator.component: manager
+  redis_data:
+    labels:
+      org.rvc-orchestrator.component: manager
+  minio_data:
+    labels:
+      org.rvc-orchestrator.component: manager
+  artifact_spool:
+    labels:
+      org.rvc-orchestrator.component: manager-transient
+  dataset_ingestion:
+    labels:
+      org.rvc-orchestrator.component: manager-transient
+  api_runtime_secrets:
+    labels:
+      org.rvc-orchestrator.component: manager-sensitive-runtime
+  maintenance_runtime_secrets:
+    labels:
+      org.rvc-orchestrator.component: manager-sensitive-runtime
+  database_authz_runtime_secrets:
+    labels:
+      org.rvc-orchestrator.component: manager-sensitive-runtime
+  mlflow_runtime_secrets:
+    labels:
+      org.rvc-orchestrator.component: manager-sensitive-runtime
