@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+exec /opt/rvc/recovery-api-entrypoint.sh alembic "$@"
