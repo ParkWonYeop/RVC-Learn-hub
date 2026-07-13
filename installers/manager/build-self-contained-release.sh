@@ -39,8 +39,12 @@ git_commit=$(git -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}' 2>/dev/null 
 python3 "$REPO_ROOT/tools/verify_release_source.py" --repo-root "$REPO_ROOT" || \
   rvc_die "self-contained Manager releases require a complete non-ignored source closure"
 
-docker buildx version >/dev/null 2>&1 || \
-  rvc_die "Docker Buildx is required to build linux/amd64 release images"
+build_backend=docker
+if docker buildx version >/dev/null 2>&1; then
+  build_backend=buildx
+else
+  rvc_warn "Docker Buildx is unavailable; using docker build with final platform verification"
+fi
 
 archive="$output_dir/rvc-manager-$version-linux-amd64.tar.gz"
 [[ ! -e $archive && ! -L $archive && ! -e $archive.sha256 && ! -L $archive.sha256 ]] || \
@@ -59,16 +63,21 @@ mlflow_base_image="ghcr.io/mlflow/mlflow:v3.1.1"
 build_application_image() {
   local reference=$1 dockerfile=$2
   shift 2
-  docker buildx build \
-    --platform linux/amd64 \
-    --pull \
-    --load \
-    --file "$REPO_ROOT/$dockerfile" \
-    --tag "$reference" \
-    --build-arg "RVC_RELEASE_VERSION=$version" \
-    --build-arg "RVC_SOURCE_COMMIT=$git_commit" \
-    "$@" \
-    "$REPO_ROOT"
+  local -a command=(docker)
+  if [[ $build_backend == buildx ]]; then
+    command+=(buildx build --load)
+  else
+    command+=(build)
+  fi
+  command+=(
+    --platform linux/amd64
+    --pull
+    --file "$REPO_ROOT/$dockerfile"
+    --tag "$reference"
+    --build-arg "RVC_RELEASE_VERSION=$version"
+    --build-arg "RVC_SOURCE_COMMIT=$git_commit"
+  )
+  "${command[@]}" "$@" "$REPO_ROOT"
 }
 
 rvc_log "building Manager API image for linux/amd64"

@@ -451,8 +451,10 @@ installers/manager/build-self-contained-release.sh \
   --output-dir dist/installers
 ```
 
-이 명령은 40자리 committed HEAD, untracked 파일까지 없는 clean tree, release source closure와
-Docker Buildx를 먼저 강제한다. API/Web/MLflow를 `linux/amd64`로 build하고 dependency image 다섯
+이 명령은 40자리 committed HEAD, untracked 파일까지 없는 clean tree와 release source closure를
+먼저 강제한다. Docker Buildx가 있으면 Buildx를 사용하고, 없으면 `docker build --platform
+linux/amd64`로 내려간 뒤 동일한 실제 image platform 검증을 수행한다. API/Web/MLflow를
+`linux/amd64`로 build하고 dependency image 다섯
 개를 같은 platform으로 준비한 뒤, 정확히 8개 role의 architecture, image ID, application user와
 version/revision label을 검증해 self-contained archive를 만든다. 현재 checkout은 committed HEAD가
 없으므로 image build 전에 fail-closed하는 것이 정상이다. 또한 upstream base/dependency tag의

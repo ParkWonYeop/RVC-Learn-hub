@@ -390,7 +390,7 @@ SBOM·vulnerability/container/secret/SAST/license/clean-host review evidence를 
 `2`는 CLI/output 오류다. 어떤 경우에도 Docker/network/scan을 실행하거나 activation을 쓰지 않고
 `activation_permitted=false`를 유지하므로 이 report를 release 승인으로 사용하지 않는다.
 
-Committed clean source에서 exact 8-role Manager self-contained build orchestration이 source/buildx/
+Committed clean source에서 exact 8-role Manager self-contained build orchestration이 source/build backend/
 linux-amd64/user/release-label gate를 먼저 적용하는지는 다음 fixture로 검증한다.
 
 ```bash

@@ -110,6 +110,11 @@ if args[:2] == ["buildx", "build"]:
     if os.environ.get("FAKE_BUILD_FAIL_REFERENCE") == tag:
         raise SystemExit(2)
     raise SystemExit(0)
+if args[:1] == ["build"]:
+    tag = args[args.index("--tag") + 1]
+    if os.environ.get("FAKE_BUILD_FAIL_REFERENCE") == tag:
+        raise SystemExit(2)
+    raise SystemExit(0)
 if args and args[0] == "pull":
     reference = args[-1]
     if os.environ.get("FAKE_PULL_FAIL_REFERENCE") == reference:
@@ -251,6 +256,32 @@ def test_release_builder_builds_and_pulls_exact_amd64_closure(tmp_path: Path) ->
     assert bundle_args.read_text(encoding="utf-8").splitlines() == expected_bundle_arguments
     assert (output / f"rvc-manager-{VERSION}-linux-amd64.tar.gz").is_file()
     assert (output / f"rvc-manager-{VERSION}-linux-amd64.tar.gz.sha256").is_file()
+
+
+def test_release_builder_falls_back_to_platform_docker_build_without_buildx(
+    tmp_path: Path,
+) -> None:
+    result, output, docker_log, bundle_args = _run(
+        tmp_path,
+        FAKE_BUILDX_MISSING="1",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "using docker build with final platform verification" in result.stderr
+
+    docker_commands = [
+        json.loads(line) for line in docker_log.read_text(encoding="utf-8").splitlines()
+    ]
+    build_commands = [command for command in docker_commands if command[:1] == ["build"]]
+    assert len(build_commands) == 3
+    for command, role in zip(build_commands, ("api", "web", "mlflow"), strict=True):
+        assert command[command.index("--platform") + 1] == "linux/amd64"
+        assert "--pull" in command
+        assert "--load" not in command
+        assert command[command.index("--tag") + 1] == SOURCE_IMAGES[role]
+        assert f"RVC_RELEASE_VERSION={VERSION}" in command
+        assert f"RVC_SOURCE_COMMIT={COMMIT}" in command
+    assert bundle_args.is_file()
+    assert (output / f"rvc-manager-{VERSION}-linux-amd64.tar.gz").is_file()
 
 
 @pytest.mark.parametrize(

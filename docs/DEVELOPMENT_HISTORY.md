@@ -20,6 +20,10 @@
   고정해 실패하던 fixture를 bundle의 실제 `manifest.env` provenance로 검증하도록 수정했다.
   이는 product verifier를 완화하지 않고, partial bundle도 이용 가능한 exact Git commit을
   기록하는 현재 builder 계약을 테스트가 따르게 한 변경이다.
+- 이 개발 호스트처럼 Buildx plugin이 없는 Docker에서도 표준 builder가 제공하는
+  `docker build --platform linux/amd64`를 사용하도록 Manager release orchestrator에 명시적 fallback을
+  추가했다. Buildx가 있으면 기존 `buildx build --load`를 그대로 사용하며, 어느 경로든 build 뒤
+  8개 image의 실제 OS/architecture, application UID와 release label 검증을 동일하게 통과해야 한다.
 
 **검증과 남은 범위**
 
@@ -30,6 +34,9 @@
   `tests/infra/test_image_bundle.py` 때문에 collection 단계에서 종료됐으며, 실제
   `test_image_bundle_closure.py`로 바로잡은 첫 실행에서는 위 `uncommitted` fixture 불일치를
   발견해 수정 후 재실행했다.
+- Buildx/표준 Docker build 두 경로와 deployment contract의 집중 회귀도 PASS했고
+  `bash -n installers/manager/build-self-contained-release.sh`를 통과했다. 실제 Docker 29 client에서
+  Buildx 명령은 부재하지만 `docker build --help`의 `--platform` 지원을 확인했다.
 - 이 변경은 source preflight 한 단계만 복구한다. 실제 linux/amd64 8-image Manager archive 생성,
   dependency image의 비어 있는 `Config.User` inspect 처리, clean Ubuntu 설치와 Worker CUDA/RVC
   runtime qualification은 별도 release gate로 남는다.
