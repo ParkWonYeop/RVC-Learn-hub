@@ -77,6 +77,14 @@ Worker Sample activation은 49개 GPU/no-network report archive와 exact runtime
 identity를 검증한 builder만 mode `0444` projection으로 생성할 수 있다. Compose는 projection을
 고정 read-only 경로에 mount하며 production factory와 Agent capability는 실제 binding evidence가
 있을 때만 네 inference F0 방식을 연다. 사용자 env/YAML/CLI flag로 이 경계를 열 수 없다.
+Release engineering용 Worker factory는 2단계다. 먼저 exact runtime image와 세 activation gate가
+false인 `NATIVE-CANDIDATE-UNVERIFIED` core 후보를 만든다. 그 exact image ID로 49-case를 끝낸 뒤에만
+별도 qualified factory가 기존 image를 다시 build·retag·remove하지 않고 증적을 결박해 재포장한다.
+두 단계는 같은 basename을 서로 다른 output directory에 보존한다. 각 factory는 private stable
+snapshot의 외부 checksum, safe tar, 내부 exact ledger/image closure와 runtime ID를 다시 검증하고 final
+archive pair를 덮어쓰기 없이 게시한다. Qualified 후보도 scan·license·reviewer·clean-host gate를 별도로
+통과하기 전에는 production 설치 파일이 아니다. 현재 실제 runtime 입력이 없어 이 factory로 생성한
+Worker archive 증적은 아직 없다.
 
 아직 v1.0은 아니다. Dataset finalize RQ/tombstone maintenance 확대, non-WAV
 sandbox decoder, 실제 CREPE weight의 출처·라이선스·SHA 승인, Torch 2.6.0/cu124 후보 runtime의

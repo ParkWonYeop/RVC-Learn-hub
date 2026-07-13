@@ -74,6 +74,15 @@ product/component, image/release/orchestrator commit, reviewed RVC/Torch/CUDA/cu
 검증한다. Disabled activation도 Git file mode에 의존하지 않고 archive stage에서 `0444`로 고정한다.
 이 결박은 실제 asset byte, GPU matrix, scan·서명·법률 검토를 대신하지 않는다.
 
+Worker release factory는 build와 qualification을 분리한다. Core factory만 exact runtime image를
+만들고 disabled archive를 게시한다. 49-case는 그 image ID를 대상으로 실행하며, qualified factory는
+기존 image/build manifest/assets/qualification/evidence를 재검증해 별도 output directory에 같은
+basename의 archive를 게시한다. 생성 직후 Docker ID와 core `images-manifest.json` runtime ID를 먼저
+일치시키고, 같은 값을 qualification digest와 qualified factory의 `--runtime-image-id`로 고정한다.
+Qualified 단계는 image build/pull/retag/remove 권한을 사용하지 않고 기존 core archive도 덮어쓰지
+않는다. 이 2단계 identity 보존은 시험 결과의 대상 image를 고정하지만 시험 실행의 진실성,
+signature, scan 결과 또는 재배포 권리를 증명하지 않는다.
+
 Bundle format 2의 `images-manifest.json`은 self-contained Manager의 정확한 8개 역할과 Worker
 runtime 1개를 source/runtime reference, Docker image/config digest, `linux/amd64`, archive
 SHA-256/size, 실제 `Config.User` 및 application OCI release label에 결박한다. Docker-save의 config
@@ -115,6 +124,10 @@ Worker runtime qualification은 SBOM과 별도 증적이다. Exact 49-case repor
 qualification, runtime image/build/asset identity를 검증한 뒤 builder가 작은 activation projection을
 만든다. 내부 `SHA256SUMS`, image manifest와 설치/start 검증이 qualification/evidence byte까지
 보존하지만 제3자 서명이나 시험 실행의 진실성, 취약점 없음 또는 법률 승인을 대신하지 않는다.
+따라서 core archive는 public release가 아니며, qualified archive도 vulnerability/container/secret
+scan, SBOM·license/redistribution review, 별도 reviewer attestation, clean-host lifecycle과 실제 외부
+TLS/browser gate 전에는 production attestation이 아니다. 현재 실제 49-case/release 증적은 없고 모든
+runtime gate는 false다.
 
 따라서 현재 파일을 완전한 release attestation, 취약점 없음 또는 재배포 권리 확인으로
 표현하면 안 된다. v1.0 전에는 Python `--require-hashes`, 모든 image digest, real-RVC

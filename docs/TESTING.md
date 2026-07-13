@@ -375,22 +375,38 @@ target `linux/amd64`와 network/pull 차단, Buildx 사용 시 `--provenance=fal
 `AUTO_SAMPLE_JOBS_ENABLED=false`, `PROFILE_STAGE_SET_VERIFIED=false`를 바꾸지 않는다.
 
 Qualification parser, exact 49-case/evidence archive, disabled/qualified projection,
-factory/capability와 installer/image 결박은 다음으로 검증한다. Runtime build manifest CLI는
+2단계 release factory/capability와 installer/image 결박은 다음으로 검증한다. Runtime build manifest CLI는
 qualification이 없는 경우에도 exact key 집합과 product/component/image/release/orchestrator identity,
 reviewed runtime lock 및 false pre-qualification gate를 요구한다. Self-contained Worker bundle은
 installer/infra/verifier/document/SBOM 입력을 exact commit export에서 stage하고 activation을 항상
-`0444`로 고정한다.
+`0444`로 고정한다. Core factory는 runtime image를 한 번 만든 뒤 private bundle 검증과 no-clobber
+게시를 수행하고, qualified factory는 명시한 exact image ID와 core build manifest를 사용해 existing
+image를 build/retag/remove 없이 재포장해야 한다. 같은 basename의 core/qualified archive는 서로 다른
+output directory에만 게시할 수 있다.
 
 ```bash
 .venv/bin/pytest -q tests/infra/test_runtime_qualification.py \
   tests/infra/test_worker_release_readiness.py \
   apps/worker/tests/test_runtime_activation.py \
   tests/infra/test_worker_runtime_packaging.py \
-  tests/infra/test_image_bundle_closure.py
+  tests/infra/test_image_bundle_closure.py \
+  tests/infra/test_release_bundle_publisher.py \
+  tests/infra/test_worker_self_contained_release.py \
+  tests/infra/test_worker_qualified_release.py
+
+bash -n installers/worker/build-self-contained-release.sh \
+  installers/worker/build-qualified-release.sh
+.venv/bin/ruff check installers/common/publish_release_bundle.py \
+  tests/infra/test_release_bundle_publisher.py \
+  tests/infra/test_worker_self_contained_release.py \
+  tests/infra/test_worker_qualified_release.py
+.venv/bin/mypy installers/common/publish_release_bundle.py
 ```
 
-여기서 qualified fixture는 합성 report다. 실제 NVIDIA GPU에서 case를 실행했다는 증거가 아니며,
-운영 activation은 `RUNTIME_QUALIFICATION.md`의 외부 review 절차를 별도로 통과해야 한다.
+Factory fixture는 Docker/runtime builder를 대역으로 사용하고 qualified fixture는 합성 report다. 따라서
+명령이 통과해도 실제 runtime image/archive를 만들거나 NVIDIA GPU에서 case를 실행한 증거가 아니다.
+운영 activation은 `RUNTIME_QUALIFICATION.md`의 exact core image ID handoff와 외부 review 절차를
+별도로 통과해야 한다. 현재 실제 증적은 없으며 모든 runtime gate는 false다.
 
 `infra/worker/runtime/release_readiness.py`는 source/wheel/asset/build/runtime/49-case와
 SBOM·vulnerability/container/secret/SAST/license/clean-host review evidence를 읽기 전용으로
@@ -551,6 +567,12 @@ tree에 mode `0444` `RELEASE_SHA256SUMS`를 원자 생성하며 재설치, Compo
 inventory만 확인하고 끝내지 않고 version, 모든 image reference, pull policy, Worker runtime/build/
 asset/qualification provenance와 gate를 manifest에 다시 결박한다. Archive의 `README.md`와
 `TESTING.md`는 해당 component/version으로 렌더링돼 있어야 한다.
+
+Worker core와 qualified archive는 같은 basename을 사용하므로 acceptance test에서 두 output
+directory를 따로 보존한다. Core archive의 `images-manifest.json` runtime `image_id`, 생성 직후
+`docker image inspect --format '{{.Id}}'` 값, qualification runtime digest와 qualified factory의
+`--runtime-image-id` 네 값이 모두 같아야 한다. Qualified factory 실행 전후 tag ID가 달라지거나
+core archive/sidecar가 덮어써지면 FAIL이다.
 
 `tests/infra/test_source_closure.py`는 self-contained build source가 broad ignore에 가려지지 않는지,
 `test_image_bundle_closure.py`는 extracted bundle ledger 제거와 Docker config content/user 변조를,

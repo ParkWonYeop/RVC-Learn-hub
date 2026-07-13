@@ -277,6 +277,10 @@
   `linux/amd64` daemon/platform gate(실제 runtime/GPU qualification은 별도 미완료)
 - [x] Worker self-contained bundle byte의 exact committed-source export, strict runtime build manifest와
   disabled/qualified activation `0444` 고정(실제 runtime 입력·GPU qualification은 별도 미완료)
+- [x] Worker disabled core 생성→exact image ID 49-case→existing image qualified 재포장의 2단계
+  candidate factory, stable private snapshot·safe archive/ledger/runtime ID 재검증, race-safe
+  no-clobber pair 게시와 core 소유 tag 실패 cleanup
+  (factory/fixture만 검증; 실제 runtime bundle·GPU/scan/clean-host gate는 미완료)
 - [x] dev.20 Manager self-contained 개발 후보의 외부 checksum·내부 exact ledger·8-role
   linux/amd64 image closure·load 뒤 identity·release-image 전체 Compose smoke 검증
   (source `298ee1ec112cc7dc3a55d8374bba8c9e38f9f55a`, schema `f5d1c8a9b240`,

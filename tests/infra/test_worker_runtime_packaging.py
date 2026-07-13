@@ -530,6 +530,11 @@ def test_real_runtime_dockerfile_and_builder_are_network_closed() -> None:
     assert 'org.rvc-orchestrator.profile-stage-set-verified="false"' in dockerfile
     assert "org.rvc-orchestrator.rvc.projection.sha256" in dockerfile
     assert "RVC_PROJECTION_MANIFEST_SHA256" in builder
+    assert "--output-image-id" in builder
+    assert "built_image_id=$(docker image inspect" in builder
+    assert builder.index("built_image_id=$(docker image inspect") < builder.index(
+        "for label_and_expected in"
+    )
 
 
 def test_projection_manifest_binds_code_config_and_assets(tmp_path: Path) -> None:
@@ -1194,6 +1199,37 @@ raise SystemExit(2)
     assert activation_member.mode & 0o222 == 0
     assert f"{root}/runtime/qualification/qualification.json" in names
     assert f"{root}/runtime/qualification/{evidence.name}" in names
+
+    published = tmp_path / "published-candidate"
+    published.mkdir()
+    publication = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "installers/common/publish_release_bundle.py"),
+            "--archive",
+            str(bundle_path),
+            "--checksum",
+            str(Path(f"{bundle_path}.sha256")),
+            "--output-dir",
+            str(published),
+            "--verifier",
+            str(ROOT / "installers/common/image_bundle.py"),
+            "--component",
+            "worker",
+            "--version",
+            version,
+            "--source-commit",
+            orchestrator_commit,
+            "--runtime-image-id",
+            image_digest,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert publication.returncode == 0, publication.stdout + publication.stderr
+    assert (published / bundle_path.name).read_bytes() == bundle_path.read_bytes()
+    assert (published / f"{bundle_path.name}.sha256").is_file()
 
     extracted = tmp_path / "qualified-extracted"
     with tarfile.open(bundle_path, "r:gz") as bundle:

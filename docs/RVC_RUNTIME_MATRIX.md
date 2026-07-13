@@ -55,6 +55,14 @@ amd64 Docker daemon을 요구한다. Worker/contract/runtime build byte는 worki
 Self-contained Worker bundle byte도 같은 commit의 Git archive에서만 stage하며 runtime build manifest의
 전체 스키마와 release/orchestrator identity를 qualification 전에도 검증한다. Disabled와 qualified
 activation은 모두 archive에서 `0444`다. 이 상태만으로 GPU/profile/Sample gate를 열지는 않는다.
+Release factory는 두 단계다. `build-self-contained-release.sh`는 exact runtime image를 만들고 disabled
+activation core archive만 게시한다. Exact image ID에 대한 49-case가 끝난 뒤
+`build-qualified-release.sh`는 기존 image와 core build manifest, 같은 asset 및 qualification/evidence를
+검증해 별도 archive로 재포장한다. 생성 직후 Docker ID, core archive `images-manifest.json`의 runtime
+ID, qualification runtime digest와 2단계 `--runtime-image-id`는 모두 같아야 한다. 2단계는 image를
+build/pull/retag/remove하지 않는다. 두 archive는 basename이 같으므로 서로 다른 output directory에
+보존하고 어느 쪽도 덮어쓰지 않는다. Core는 qualification용 engineering 입력일 뿐 public release가
+아니다.
 [PyTorch serialization 문서](https://docs.pytorch.org/docs/stable/notes/serialization.html)의
 2.6 기본 동작에 의존하지 않고 loader마다 `weights_only`를 명시한다. `>=2.6`이라는 버전 숫자나
 checksum만으로 operator-trusted pickle의 안전성과 전체 RVC 호환성이 증명됐다고 보지 않는다.
@@ -128,6 +136,9 @@ sample Job을 배정하지 않으며 방어적으로 workspace 생성 전에도 
 11. 위 결과를 `RUNTIME_QUALIFICATION.md`의 exact 49-case report archive로 만들고 runtime
     image/build/asset identity에 결박한 qualification projection이 설치/start/Worker binding을
     통과하는지 확인한다.
+12. Core와 qualified archive를 서로 다른 output directory에 보존하고, qualified factory가 exact
+    existing image ID를 유지한 채 build/retag/remove 없이 재포장했음을 확인한다. Qualified archive도
+    scan·license·reviewer·clean-host·외부 TLS gate 전에는 production으로 승격하지 않는다.
 
 이 gate가 모두 통과하기 전 offline runtime bundle은 guarded 개발 후보이며 실제 RVC
 학습 설치 파일로 출시하지 않는다. 설치기는 `RVC_NATIVE_RUNNER_AVAILABLE=true`인 bundle만

@@ -1044,58 +1044,99 @@ infra/worker/runtime/build-runtime-image.sh \
   --verify-only
 ```
 
-검토한 base digest를 로컬에 미리 load한 뒤 runtime image를 만든다.
+검토한 base digest를 로컬에 미리 load한 뒤 1단계 core factory를 실행한다. 이 factory만 runtime
+image를 만들며 qualification 입력을 받지 않는다.
 
 ```bash
 export RELEASE_VERSION=0.1.0-rc.1
 export REVIEWED_BASE_IMAGE='pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime@sha256:REPLACE_WITH_REVIEWED_AMD64_DIGEST'
+export CORE_OUTPUT_DIR=/offline/candidates/core
+export QUALIFIED_OUTPUT_DIR=/offline/candidates/qualified
+install -d -m 0700 /offline/candidates
+test ! -e "$CORE_OUTPUT_DIR" && test ! -e "$QUALIFIED_OUTPUT_DIR"
 
-infra/worker/runtime/build-runtime-image.sh \
+installers/worker/build-self-contained-release.sh \
+  --version "$RELEASE_VERSION" \
   --source-archive /offline/source/rvc-source.tar.gz \
   --source-manifest /offline/source/source-manifest.json \
   --wheelhouse /offline/wheelhouse \
+  --wheelhouse-manifest /offline/wheelhouse/wheelhouse-manifest.json \
   --assets /offline/assets \
+  --asset-manifest /offline/assets/assets-manifest.json \
   --base-image "$REVIEWED_BASE_IMAGE" \
-  --tag "rvc-orchestrator-worker:$RELEASE_VERSION" \
-  --output-manifest /offline/output/rvc-runtime-build.env
+  --output-dir "$CORE_OUTPUT_DIR"
 ```
 
 `REPLACE_WITH_REVIEWED_AMD64_DIGEST`를 실제 64자리 digest로 바꾸지 않은 명령은 의도적으로
-실패해야 한다. 예시 release version도 조직의 실제 후보 version으로 바꾼다.
+실패해야 한다. 예시 release version도 조직의 실제 후보 version으로 바꾼다. Factory는 clean 40-hex
+source, release source closure와 amd64 Docker daemon을 요구한다. Exact image/build manifest와 false
+pre-qualification gate를 검증하고 bundle을 private directory에서 다시 검사한 뒤에만 no-clobber로
+게시한다.
 
-아래 두 bundle builder 명령은 형식을 보여 주는 예시다. 실제 실행 전 이 절의 readiness report까지
-읽고 입력 누락과 identity 불일치를 먼저 확인한다. Qualification이 없는 core-only 후보는 다음처럼
-disabled Sample activation을 포함한 self-contained Worker bundle을 만든다.
+1단계 결과는 세 activation gate가 false인 `NATIVE-CANDIDATE-UNVERIFIED` core 후보이며 public
+release가 아니다. 다음처럼 외부 checksum, 내부 ledger/bundle closure를 검증해 private directory에
+추출하고 Docker ID와 archive runtime ID를 하나의 handoff 값으로 고정한다.
 
 ```bash
-installers/worker/build-bundle.sh \
-  --version "$RELEASE_VERSION" \
-  --self-contained \
-  --include-rvc-runtime-image "rvc-orchestrator-worker:$RELEASE_VERSION" \
-  --rvc-runtime-assets /offline/assets \
-  --rvc-runtime-asset-manifest /offline/assets/assets-manifest.json \
-  --rvc-runtime-build-manifest /offline/output/rvc-runtime-build.env
+(
+  set -Eeuo pipefail
+  CORE_ARCHIVE="$CORE_OUTPUT_DIR/rvc-worker-$RELEASE_VERSION-linux-amd64.tar.gz"
+  CORE_EXTRACT_ROOT=/offline/candidates/core-extracted
+  test -f "$CORE_ARCHIVE" && test ! -L "$CORE_ARCHIVE"
+  test -f "$CORE_ARCHIVE.sha256" && test ! -L "$CORE_ARCHIVE.sha256"
+  (cd "$CORE_OUTPUT_DIR" && sha256sum -c "$(basename "$CORE_ARCHIVE.sha256")")
+  test ! -e "$CORE_EXTRACT_ROOT"
+  install -d -m 0700 "$CORE_EXTRACT_ROOT"
+  tar -xzf "$CORE_ARCHIVE" -C "$CORE_EXTRACT_ROOT"
+
+  CORE_BUNDLE="$CORE_EXTRACT_ROOT/rvc-worker-$RELEASE_VERSION-linux-amd64"
+  cd "$CORE_BUNDLE"
+  sha256sum -c SHA256SUMS
+  python3 common/image_bundle.py verify-ledger --root . --ledger-name SHA256SUMS
+  SOURCE_COMMIT=$(awk -F= '$1 == "GIT_COMMIT" {print $2; exit}' manifest.env)
+  python3 common/image_bundle.py verify-bundle \
+    --root . \
+    --component worker \
+    --version "$RELEASE_VERSION" \
+    --source-commit "$SOURCE_COMMIT"
+
+  CORE_IMAGE_ID=$(docker image inspect --format '{{.Id}}' \
+    "rvc-orchestrator-worker:$RELEASE_VERSION")
+  CORE_MANIFEST_IMAGE_ID=$(python3 -c '
+import json, pathlib, sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+images = data["images"]
+assert len(images) == 1 and images[0]["role"] == "runtime"
+print(images[0]["image_id"])
+' images-manifest.json)
+  test "$CORE_IMAGE_ID" = "$CORE_MANIFEST_IMAGE_ID"
+  test -f runtime/build-manifest.env && test ! -L runtime/build-manifest.env
+)
 ```
 
-실제 49-case GPU/no-network matrix와 review가 끝났다면 qualification 입력까지 포함한 전체 명령을
-사용한다.
+검증된 core archive의 `images-manifest.json`이 이후 handoff의 권위 원장이다. 모든 49-case report와
+`runtime-qualification.json`은 그 exact ID를 사용해야 한다. Tag를 rebuild/retag한 뒤 같은 이름으로
+증적을 재사용하지 않는다. 49-case 수행·case ID·evidence schema는 이 가이드 8절과
+[Worker runtime qualification](RUNTIME_QUALIFICATION.md)을 따른다.
+
+GPU/no-network 49-case와 reviewer evidence가 준비되면 read-only readiness report로
+source/wheel/asset/build/runtime/qualification/review의 누락과 identity 불일치를 한 번에 열거한다.
 
 ```bash
-installers/worker/build-bundle.sh \
-  --version "$RELEASE_VERSION" \
-  --self-contained \
-  --include-rvc-runtime-image "rvc-orchestrator-worker:$RELEASE_VERSION" \
-  --rvc-runtime-assets /offline/assets \
-  --rvc-runtime-asset-manifest /offline/assets/assets-manifest.json \
-  --rvc-runtime-build-manifest /offline/output/rvc-runtime-build.env \
-  --rvc-runtime-qualification /offline/review/runtime-qualification.json \
-  --rvc-runtime-qualification-evidence /offline/review/runtime-evidence.tar.gz
-```
+export CORE_BUNDLE=/offline/candidates/core-extracted/rvc-worker-$RELEASE_VERSION-linux-amd64
+export CORE_BUILD_MANIFEST="$CORE_BUNDLE/runtime/build-manifest.env"
+CORE_IMAGE_ID=$(python3 -c '
+import json, pathlib, sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+images = data["images"]
+assert len(images) == 1 and images[0]["role"] == "runtime"
+print(images[0]["image_id"])
+' "$CORE_BUNDLE/images-manifest.json")
+export CORE_IMAGE_ID
+CURRENT_CORE_IMAGE_ID=$(docker image inspect --format '{{.Id}}' \
+  "rvc-orchestrator-worker:$RELEASE_VERSION")
+test "$CURRENT_CORE_IMAGE_ID" = "$CORE_IMAGE_ID"
 
-위 builder를 실제 게시 후보에 사용하기 전에는 read-only readiness report로 누락/불일치 evidence를
-한 번에 열거한다.
-
-```bash
 python3 infra/worker/runtime/release_readiness.py \
   --source-manifest /offline/source/source-manifest.json \
   --source-archive /offline/source/rvc-source.tar.gz \
@@ -1103,8 +1144,8 @@ python3 infra/worker/runtime/release_readiness.py \
   --wheelhouse-root /offline/wheelhouse \
   --asset-manifest /offline/assets/assets-manifest.json \
   --asset-root /offline/assets \
-  --runtime-build-manifest /offline/output/rvc-runtime-build.env \
-  --runtime-image-digest 'sha256:REPLACE_WITH_64_HEX' \
+  --runtime-build-manifest "$CORE_BUILD_MANIFEST" \
+  --runtime-image-digest "$CORE_IMAGE_ID" \
   --qualification-manifest /offline/review/runtime-qualification.json \
   --qualification-evidence /offline/review/runtime-evidence.tar.gz \
   --release-review /offline/review/release-review.json \
@@ -1119,10 +1160,34 @@ scan 실행 또는 법적 판단을 하지 않고 activation을 만들지도 않
 `activation_permitted=false`, `activation_projection_written=false`가 유지되는 것이 정상이며 실제
 builder/qualification/start gate를 대신하지 않는다.
 
+Readiness 입력 검증과 release review가 끝난 뒤에만 2단계 qualified factory를 실행한다. 이 명령은
+기존 exact image, extracted core build manifest, 원래 asset과 qualification/evidence를 재검증하고
+새 image를 build/pull/retag/remove하지 않는다.
+
+```bash
+installers/worker/build-qualified-release.sh \
+  --version "$RELEASE_VERSION" \
+  --runtime-image-id "$CORE_IMAGE_ID" \
+  --runtime-build-manifest "$CORE_BUILD_MANIFEST" \
+  --assets /offline/assets \
+  --asset-manifest /offline/assets/assets-manifest.json \
+  --qualification /offline/review/runtime-qualification.json \
+  --qualification-evidence /offline/review/runtime-evidence.tar.gz \
+  --output-dir "$QUALIFIED_OUTPUT_DIR"
+```
+
+Core와 qualified archive basename은 모두
+`rvc-worker-$RELEASE_VERSION-linux-amd64.tar.gz`이다. `CORE_OUTPUT_DIR`와
+`QUALIFIED_OUTPUT_DIR`은 반드시 서로 달라야 하며 기존 archive/sidecar를 삭제하거나 덮어쓰지
+않는다. Core는 qualification 입력 원장으로 계속 보존한다. Qualified factory 성공도 production
+승인은 아니다. Vulnerability/container/secret scan, SBOM·license/redistribution 검토, 별도 reviewer
+attestation, clean Ubuntu install/reboot/upgrade와 실제 Manager/Object 외부 TLS/browser gate를 모두
+통과해야 한다.
+
 Schema, report ID와 증적 수집 규칙은 [Worker runtime qualification](RUNTIME_QUALIFICATION.md)을
 따른다. Builder가 activation을 직접 생성하므로 activation JSON이나 verified boolean을 입력으로
-전달하지 않는다. 증적이 없으면 bundle은 disabled projection을 포함하고 Sample capability를 열지
-않는다.
+전달하지 않는다. 증적이 없으면 core bundle의 disabled projection과 세 false gate를 유지하고
+qualified factory를 실행하지 않는다.
 
 구체 manifest schema와 입력 목록은 `infra/worker/runtime/README.md`를 따른다. 현재 저장소에는
 승인된 실제 base digest와 재배포 가능한 전체 자산 byte가 없으므로 위 placeholder를 임의 값으로
@@ -1138,18 +1203,25 @@ archive에는 정확한 committed source 기준선이 있지만 Worker runtime i
 별도 검토한 뒤 진행한다.
 
 Release build host에서는 생성된 archive와 sidecar가 실제로 생겼고 외부 checksum이 맞는지 먼저
-확인한 뒤, 두 파일만 신뢰된 전송 수단으로 clean Worker host에 전달한다.
+확인한다. Clean-host qualification engineering이면 core directory를 명시하되 public release로
+전달하지 않는다. Qualified acceptance이면 별도 qualified directory를 명시한다. 아래 예시는
+2단계 결과를 선택하며 core archive를 덮어쓰거나 같은 directory로 합치지 않는다.
 
 ```bash
 (
   set -Eeuo pipefail
   : "${RELEASE_VERSION:?set RELEASE_VERSION to the candidate version}"
-  WORKER_ARCHIVE="dist/installers/rvc-worker-$RELEASE_VERSION-linux-amd64.tar.gz"
+  : "${QUALIFIED_OUTPUT_DIR:?set the separate qualified output directory}"
+  WORKER_ARCHIVE="$QUALIFIED_OUTPUT_DIR/rvc-worker-$RELEASE_VERSION-linux-amd64.tar.gz"
   test -f "$WORKER_ARCHIVE" && test ! -L "$WORKER_ARCHIVE"
   test -f "$WORKER_ARCHIVE.sha256" && test ! -L "$WORKER_ARCHIVE.sha256"
-  sha256sum -c "$WORKER_ARCHIVE.sha256"
+  (cd "$QUALIFIED_OUTPUT_DIR" && sha256sum -c "$(basename "$WORKER_ARCHIVE.sha256")")
 )
 ```
+
+Qualification과 남은 release gate가 끝나기 전에는 이 pair도 production 설치 파일로 배포하지
+않는다. Clean Worker acceptance host에는 선택한 candidate의 두 파일만 신뢰된 전송 수단으로
+전달한다.
 
 ### Clean Worker host에서 archive 검증과 `--no-start` 설치
 

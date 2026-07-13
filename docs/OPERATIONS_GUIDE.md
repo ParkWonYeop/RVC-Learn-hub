@@ -186,6 +186,15 @@ bundle이 별도로 준비된 뒤에만 적용한다. dev.17에서 도입되어 
 projection은 clean Ubuntu의 실제
 Manager/Object endpoint 연결 증거 전에는 production 사설 CA 인수를 완료로 판정하지 않는다.
 
+향후 self-contained Worker release engineering은 2단계다. Core factory는 disabled activation을 가진
+exact runtime image/archive만 만들고, 운영자는 그 image ID와 core archive
+`images-manifest.json`의 runtime ID가 같은지 확인한 뒤 49-case를 수행한다. Qualified factory는 같은
+ID를 `--runtime-image-id`로 받아 existing image/build manifest/assets/qualification/evidence를
+재포장할 뿐 image를 build/retag/remove하지 않는다. Core와 qualified archive는 basename이 같으므로
+별도 output directory에 보존하고 core를 덮어쓰지 않는다. Core는 public release가 아니며 qualified
+archive도 scan·license·reviewer·clean-host·실제 외부 TLS/browser gate 전에는 production 운영에
+투입하지 않는다. 현재 해당 실제 증적은 없어 모든 runtime gate는 false다.
+
 1. Manager host의 `/etc/rvc-orchestrator/manager/secrets/worker_bootstrap_token`을
    운영 secret 전달 수단으로 Worker의 임시 mode `0600` 파일에 복사한다. 값을 terminal
    명령행, 메신저나 CI 로그에 출력하지 않는다.

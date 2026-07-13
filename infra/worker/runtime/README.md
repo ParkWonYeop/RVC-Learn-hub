@@ -231,56 +231,118 @@ base digest has not been selected and reviewed in this repository, and the full
 GPU/no-network, vulnerability, container, SBOM, redistribution-license, and
 clean-host lifecycle gates remain open.
 
-## Optional Worker bundle inclusion
+## Two-phase Worker release factory
 
-The installer bundle includes a real runtime only when the image, original
-asset root/manifest, and build manifest all agree:
+Do not make qualification an optional input to the command that builds a new
+image. A qualification must identify the exact image that was actually tested,
+and a later rebuild may produce a different image ID. The supported flow is
+therefore core candidate first, qualified repackaging second.
 
-```bash
-installers/worker/build-bundle.sh \
-  --version <version> \
-  --self-contained \
-  --include-rvc-runtime-image rvc-orchestrator-worker:<version> \
-  --rvc-runtime-assets /offline/assets \
-  --rvc-runtime-asset-manifest /offline/assets/assets-manifest.json \
-  --rvc-runtime-build-manifest /offline/output/rvc-runtime-build.env
-```
-
-The runtime image must use the exact tag selected by the installer. The bundle
-builder exports its infra, installer, verifier, documentation and supply-chain
-inputs from the same clean committed Git revision instead of copying mutable host
-working-tree bytes. It validates the complete runtime build-manifest schema even
-before qualification, re-hashes every asset, checks all provenance labels including the
-projection-manifest SHA-256, verifies amd64, and then stores a Docker image
-archive plus asset/build manifests. Generic `--include-image` cannot duplicate
-the runtime image. The resulting manifest carries
-`RVC_PROJECTION_MANIFEST_SHA256`, sets `RVC_NATIVE_RUNNER_AVAILABLE=true`, and
-keeps `RVC_NATIVE_SAMPLE_INFERENCE_VERIFIED=false`. The disabled activation is
-also explicitly stored as mode `0444`; it does not depend on the host checkout's
-file mode.
-
-After the real matrix has run, provide both the strict qualification JSON and its
-49-report evidence archive. The bundle builder validates them against the exact
-post-build image ID and runtime/asset manifests, then generates (never accepts)
-the activation projection:
+Phase 1 builds the exact image and publishes only a disabled core candidate:
 
 ```bash
-installers/worker/build-bundle.sh \
-  --version <version> \
-  --self-contained \
-  --include-rvc-runtime-image rvc-orchestrator-worker:<version> \
-  --rvc-runtime-assets /offline/assets \
-  --rvc-runtime-asset-manifest /offline/assets/assets-manifest.json \
-  --rvc-runtime-build-manifest /offline/output/rvc-runtime-build.env \
-  --rvc-runtime-qualification /offline/review/runtime-qualification.json \
-  --rvc-runtime-qualification-evidence /offline/review/runtime-evidence.tar.gz
+export RELEASE_VERSION=0.1.0-rc.1
+export CORE_OUTPUT_DIR=/offline/candidates/core
+export QUALIFIED_OUTPUT_DIR=/offline/candidates/qualified
+install -d -m 0700 /offline/candidates
+test ! -e "$CORE_OUTPUT_DIR" && test ! -e "$QUALIFIED_OUTPUT_DIR"
+
+installers/worker/build-self-contained-release.sh \
+  --version "$RELEASE_VERSION" \
+  --source-archive /offline/source/rvc-source.tar.gz \
+  --source-manifest /offline/source/source-manifest.json \
+  --wheelhouse /offline/wheelhouse \
+  --wheelhouse-manifest /offline/wheelhouse/wheelhouse-manifest.json \
+  --assets /offline/assets \
+  --asset-manifest /offline/assets/assets-manifest.json \
+  --base-image 'pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime@sha256:<reviewed-amd64-digest>' \
+  --output-dir "$CORE_OUTPUT_DIR"
 ```
+
+The factory requires a clean 40-hex committed source, a complete release source
+closure and an amd64 Docker daemon. It creates
+`rvc-orchestrator-worker:$RELEASE_VERSION`, validates its build manifest, user,
+labels and false pre-qualification gates, builds the bundle in a private
+directory, re-verifies the external checksum, safe tar shape, exact internal
+ledger, image closure and image ID, and only then performs a no-clobber publish.
+The runtime builder writes the exact Docker image ID to a private ownership
+record immediately after the build and before its post-build label/manifest
+checks. If one of those later checks fails, the factory removes the tag only
+when it still resolves to that recorded ID; a replaced tag is preserved.
+The core archive contains `runtime/build-manifest.env` and mode-`0444` disabled
+activation. It is an engineering and qualification input, not a public release.
+
+Run all 49 GPU/no-network cases against that still-existing exact image. Preserve
+the image ID, the verified extracted core build manifest, the original asset
+bytes and the reviewed qualification/evidence. Phase 2 then repackages them:
+
+```bash
+CORE_IMAGE_ID=$(docker image inspect --format '{{.Id}}' \
+  "rvc-orchestrator-worker:$RELEASE_VERSION")
+export CORE_IMAGE_ID
+export CORE_BUNDLE=/offline/candidates/core-extracted/rvc-worker-$RELEASE_VERSION-linux-amd64
+export CORE_BUILD_MANIFEST="$CORE_BUNDLE/runtime/build-manifest.env"
+CORE_MANIFEST_IMAGE_ID=$(python3 -c '
+import json, pathlib, sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+images = data["images"]
+assert len(images) == 1 and images[0]["role"] == "runtime"
+print(images[0]["image_id"])
+' "$CORE_BUNDLE/images-manifest.json")
+test "$CORE_MANIFEST_IMAGE_ID" = "$CORE_IMAGE_ID"
+
+installers/worker/build-qualified-release.sh \
+  --version "$RELEASE_VERSION" \
+  --runtime-image-id "$CORE_IMAGE_ID" \
+  --runtime-build-manifest "$CORE_BUILD_MANIFEST" \
+  --assets /offline/assets \
+  --asset-manifest /offline/assets/assets-manifest.json \
+  --qualification /offline/review/runtime-qualification.json \
+  --qualification-evidence /offline/review/runtime-evidence.tar.gz \
+  --output-dir "$QUALIFIED_OUTPUT_DIR"
+```
+
+Before qualification, read the single runtime `image_id` from the verified core
+archive's `images-manifest.json` and require it to equal `CORE_IMAGE_ID`. Use that
+same value for the qualification runtime digest and the factory's
+`--runtime-image-id`; never rediscover or substitute a later tag ID.
+
+The qualified factory requires the existing exact image and refuses to build,
+pull, retag or remove it. It verifies the image ID before and after private
+bundle creation, validates the qualification against that ID and publishes only
+after the same closed-world checks. A missing or changed tag, mismatched build
+manifest/assets/evidence, or publication collision fails without publishing a
+final pair.
+
+Both phases produce the basename
+`rvc-worker-$RELEASE_VERSION-linux-amd64.tar.gz`. The output directories must be
+different, and neither archive nor sidecar may be overwritten. Keep the core
+archive as the immutable qualification input; do not replace it with the
+qualified bytes.
+
+The low-level `build-bundle.sh` remains the bundle primitive used by these
+factories. Release operators should use the two factory commands above so image
+ownership, private verification and race-safe publication are enforced. The
+runtime image must use the exact tag selected by the installer. Bundle inputs
+for infra, installer, verifier, documentation and supply-chain reporting are
+exported from the same clean committed Git revision rather than copied from
+mutable host working-tree bytes. The complete build-manifest schema, every asset,
+all provenance labels including the projection-manifest SHA-256 and amd64 are
+verified before the Docker image archive is stored. Generic `--include-image`
+cannot duplicate the runtime image.
 
 The generated `runtime-activation.json` is mode `0444`, mounted at the fixed
 read-only container path, and rechecked against the installed image, asset,
 qualification, and evidence bytes. Environment, YAML, and CLI inputs cannot
 choose another activation path. See `docs/RUNTIME_QUALIFICATION.md` for the exact
 case IDs and schema.
+
+A qualified archive is still only a release candidate. It must separately pass
+vulnerability/container/secret scans, SBOM and redistribution-license review,
+release reviewer attestation, clean-host install/reboot/upgrade tests and real
+external Manager/Object TLS and browser acceptance before production promotion.
+No real evidence currently exists, so all runtime gates remain false in current
+artifacts.
 
 Bundle format v2 is a closed-world image contract. A self-contained Worker has
 exactly one `runtime` image; pre-load archive hash/size, Docker-save inventory,

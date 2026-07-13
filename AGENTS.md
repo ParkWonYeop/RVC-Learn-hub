@@ -336,6 +336,20 @@
   exact Git archive에서만 가져온다. Runtime build manifest는 qualification 유무와 관계없이 exact
   schema, release version, orchestrator commit과 image identity를 검증하고 disabled activation도
   archive 안에서 mode `0444`를 유지한다.
+  Worker release factory는 반드시 두 단계다. Core factory만 새 runtime image를 만들고 disabled
+  activation 후보를 별도 output에 게시한다. 49-case는 그 exact image ID로 실행하며, qualified
+  factory는 같은 existing image ID와 core build manifest, asset, qualification/evidence를 요구하고
+  image를 build/pull/retag/remove하지 않는다. Basename이 같은 core/qualified archive는 서로 다른
+  output directory에 보존하고 어느 쪽도 덮어쓰지 않는다. 두 factory 모두 final output에 직접 bundle을
+  쓰지 않는다. Publisher는 verifier/archive/checksum을 private stable snapshot으로 먼저 고정하고,
+  외부 checksum, safe tar root/type, 내부 exact ledger/image closure, runtime image ID와 activation mode를
+  다시 검증한 뒤 sidecar 먼저, archive 마지막 순서의 fsync/no-clobber hard-link 게시를 사용한다.
+  Runtime builder는 Docker build 직후 post-build label/manifest 검증보다 먼저 private ownership record에
+  exact image ID를 원자 게시한다. Core 실패 cleanup은 이 실행의 record가 있고 tag가 그 image ID를
+  계속 가리킬 때만 제거하고,
+  교체되거나 기존에 있던 tag와 qualified factory의 existing image를 삭제하지 않는다. Qualification이
+  있어도 scan/license/reviewer/clean-host gate까지 자동 승인하거나 결과를 production release라고 부르지
+  않는다.
   Cross-architecture Buildx release는 dependency source tag도 target platform의 zero-layer image로
   materialize한 뒤 실제 architecture를 검사한다. `docker pull --platform` 출력만으로 target tag의
   local platform을 증명하지 않는다. Manager dependency image는 rollback tag overwrite를 막는

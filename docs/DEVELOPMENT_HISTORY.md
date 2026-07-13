@@ -4,6 +4,71 @@
 
 ## 2026-07-13
 
+### Worker 2단계 self-contained candidate factory와 stable no-clobber 게시
+
+**목적과 변경 범위**
+
+- Qualification report가 새 image의 exact Docker ID를 요구하므로 release factory를 순환 없는 두
+  단계로 분리했다. `build-self-contained-release.sh`만 exact RVC source/wheelhouse/assets/base에서 새
+  runtime image를 만들고 세 activation gate가 false인 core 후보만 게시한다. Clean 40-hex source와
+  release closure, amd64 Docker daemon, 미사용 exact version tag, strict runtime build manifest,
+  linux/amd64, user `10001:10001`, version/revision/runtime label을 확인하며 qualification option은
+  Docker 실행 전에 거부한다.
+- 49-case는 core 생성 직후 기록한 exact image ID로 수행한다. 증적 확정 뒤
+  `build-qualified-release.sh`가 그 ID, core archive에서 검증·추출한 build manifest, 같은 asset과
+  qualification/evidence를 요구해 기존 image를 재포장한다. 이 단계는 runtime image를 build, pull,
+  retag 또는 remove하지 않으며 tag ID가 전후에 바뀌면 final archive를 게시하지 않는다. Basename이
+  같은 core/qualified archive는 서로 다른 output directory에 no-clobber로 보존한다.
+- 두 factory 모두 bundle을 사용자 output이 아닌 mode `0700` private directory에 먼저 만든다. 새 표준
+  라이브러리 `publish_release_bundle.py`는 trusted verifier, archive와 checksum을 먼저 private stable
+  snapshot으로 복제하고 원본 FD 안정성 확인을 끝낸다. 그 뒤 외부 checksum을 검증하고 tar member를
+  expected single root의 regular file/directory로만 bounded 추출하며, 내부 `SHA256SUMS`, image closure,
+  self-contained/runtime 상태, exact image ID와 activation read-only mode를 다시 검사한다.
+- Final 게시도 output의 private temp에 streaming copy/fsync한 뒤 sidecar를 먼저, archive를 마지막에
+  hard-link하는 no-clobber 경계다. 경쟁 파일이 나타나면 factory가 만든 sidecar만 inode를 확인해
+  rollback하고 기존/경쟁 byte를 덮어쓰거나 지우지 않는다. Core build 뒤 실패하면 시작 시 없었고
+  runtime builder가 Docker build 직후 post-build 검증보다 먼저 private ownership record에 게시한
+  image ID를 계속 가리키는 factory-owned tag만 제거한다. Builder가 tag를 만든 뒤 label/manifest
+  검증에서 실패해도 이 record로 정리하며, tag가 교체됐으면 보존한다. Qualified factory는 기존
+  image를 어떤 실패에서도 정리하지 않는다.
+- 성공 로그도 각각 core 또는 qualified “candidate”로만 표시한다. Qualified 후보 역시 scan,
+  license/redistribution, reviewer attestation, clean-host와 실제 외부 TLS gate가 별도이며 production
+  release를 자동 선언하지 않는다.
+
+**변경 파일과 검증**
+
+- 추가: `installers/worker/build-self-contained-release.sh`,
+  `installers/worker/build-qualified-release.sh`, `installers/common/publish_release_bundle.py`와 세 전용
+  회귀 파일. `Makefile`의 기본 Ruff/mypy gate에 publisher를 포함하고 committed-source verifier 경계를
+  `test_deployment_config.py`가 직접 검사하도록 갱신했다. 설치·배포·시험·runtime qualification/
+  supply-chain 문서와 체크리스트·추적표·AGENTS 지침도 함께 갱신했다.
+- Publisher 회귀는 checksum/tar traversal·symlink, activation/runtime ID/verifier 오류, verifier 경로와
+  source archive 교체 뒤 stable snapshot 사용, output symlink·경쟁 archive와 pair rollback을 확인했다.
+  Core factory 회귀는 dirty/no-HEAD/non-amd64, output/tag collision, strict build manifest, image
+  OS/arch/user/label/gate, qualification option 거부, private output, partial/subbuilder/publisher 실패,
+  post-build builder 실패의 owned tag cleanup과 failure 중 tag swap 보존을 확인했다. Qualified factory
+  회귀 28건은 exact requested image ID,
+  기존 image 재사용, 필수 입력/manifest/image identity, partial failure와 tag swap을 확인하고 모든
+  경로에서 runtime builder와 image remove/retag가 호출되지 않음을 검증했다.
+- 실제 synthetic qualified bundle을 real `image_bundle.py`로 ledger/image closure 검증한 뒤 publisher로
+  다시 게시하는 통합 회귀도 PASS했다. Shell syntax, Ruff, publisher mypy와 whitespace 검사를
+  통과했다.
+- 집중 회귀 `81 passed`(publisher 11, core factory 29, qualified factory 28, runtime packaging 13)를
+  통과했다. 첫 전체 `make check`는 Worker committed Git archive verifier를 예전 worktree 경로로
+  단정한 배포 구성 회귀 하나를 발견해 `818 passed, 1 failed, 4 deselected`로 끝났다. 회귀를 더 강한
+  committed-source 계약으로 수정하고 publisher를 기본 정적 검사 대상에 포함했다. 최종 리뷰에서 찾은
+  post-build builder 실패/tag swap 회귀 2건까지 추가한 뒤 재실행해 Python `821 passed, 4 deselected`,
+  Ruff PASS, mypy `89 source files`, Web `24 files/211 tests`, ESLint, Next.js production build, 전체
+  shell syntax와 `git diff --check`를 모두 통과했다.
+
+**남은 위험**
+
+- 실제 reviewed amd64 base digest, 완전한 linux_x86_64 wheelhouse, 27개 strict asset byte와
+  redistribution 승인이 없어서 factory로 실제 Worker archive를 만들지는 못했다. NVIDIA GPU core/
+  F0/Sample/운영 49-case, no-egress, scan·SBOM/license/clean Ubuntu lifecycle도 모두 남아 있다.
+- Qualification report JSON의 case별 의미 schema와 신뢰 reviewer attestation은 아직 강화 전이다.
+  현재 qualification fixture는 control-flow 검증일 뿐 실제 GPU 합격 증거가 아니다.
+
 ### Worker bundle committed-source·strict runtime identity 경계
 
 **목적과 변경 범위**

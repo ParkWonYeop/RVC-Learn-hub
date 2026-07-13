@@ -38,13 +38,14 @@ lint-python:
 	$(RUFF) check packages/contracts apps/api apps/worker infra/worker/runtime/qualification.py \
 		infra/worker/runtime/release_readiness.py \
 		infra/runtime/manager-secrets-init.py infra/runtime/maintenance-db-authz.py \
-		installers/common/image_bundle.py tools tests/infra
+		installers/common/image_bundle.py installers/common/publish_release_bundle.py \
+		tools tests/infra
 
 typecheck-python:
 	$(MYPY) packages/contracts/src apps/api/src apps/worker/src \
 		infra/worker/runtime/qualification.py infra/worker/runtime/release_readiness.py \
 		infra/runtime/manager-secrets-init.py infra/runtime/maintenance-db-authz.py \
-		installers/common/image_bundle.py \
+		installers/common/image_bundle.py installers/common/publish_release_bundle.py \
 		tools/generate_supply_chain_report.py tools/verify_release_source.py
 
 test-web:

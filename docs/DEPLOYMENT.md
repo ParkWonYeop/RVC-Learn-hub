@@ -443,23 +443,75 @@ vulnerability/container/license 검토가 남아 있으므로 Manager의
 `RVC_GPU_SMOKE_VERIFIED=false`, `PROFILE_STAGE_SET_VERIFIED=false`,
 `RVC_NATIVE_SAMPLE_INFERENCE_VERIFIED=false`를 명시한다.
 
-실제 49-case qualification이 끝난 release만 다음 전체 bundle 명령을 사용한다.
+Release installer 후보는 두 단계 factory로 만든다. 1단계는 exact runtime image를 만들고 disabled
+activation core archive만 게시한다.
 
 ```bash
-installers/worker/build-bundle.sh \
-  --version <version> \
-  --self-contained \
-  --include-rvc-runtime-image rvc-orchestrator-worker:<version> \
-  --rvc-runtime-assets /offline/assets \
-  --rvc-runtime-asset-manifest /offline/assets/assets-manifest.json \
-  --rvc-runtime-build-manifest /offline/output/rvc-runtime-build.env \
-  --rvc-runtime-qualification /offline/review/runtime-qualification.json \
-  --rvc-runtime-qualification-evidence /offline/review/runtime-evidence.tar.gz
+export RELEASE_VERSION=0.1.0-rc.1
+export CORE_OUTPUT_DIR=/offline/candidates/core
+export QUALIFIED_OUTPUT_DIR=/offline/candidates/qualified
+install -d -m 0700 /offline/candidates
+test ! -e "$CORE_OUTPUT_DIR" && test ! -e "$QUALIFIED_OUTPUT_DIR"
+
+installers/worker/build-self-contained-release.sh \
+  --version "$RELEASE_VERSION" \
+  --source-archive /offline/source/rvc-source.tar.gz \
+  --source-manifest /offline/source/source-manifest.json \
+  --wheelhouse /offline/wheelhouse \
+  --wheelhouse-manifest /offline/wheelhouse/wheelhouse-manifest.json \
+  --assets /offline/assets \
+  --asset-manifest /offline/assets/assets-manifest.json \
+  --base-image 'pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime@sha256:<reviewed-amd64-digest>' \
+  --output-dir "$CORE_OUTPUT_DIR"
 ```
 
-Builder는 입력 activation boolean을 받지 않고 검증된 증적에서 mode `0444` projection을 직접
-만든다. 설치/start 시 exact image ID, asset/qualification/evidence hash와 고정 read-only mount를
-다시 검증한다. 증적이 없으면 disabled projection과 세 false gate가 유지된다.
+Core archive는 GPU qualification용 engineering 입력이며 public release가 아니다. 외부 checksum,
+내부 exact ledger와 bundle closure를 검증해 별도 private directory에 추출한다. 생성 직후 Docker
+image ID와 extracted `images-manifest.json`의 단일 runtime `image_id`를 비교하고 그 값을 qualification
+handoff로 고정한다.
+
+```bash
+export CORE_BUNDLE=/offline/candidates/core-extracted/rvc-worker-$RELEASE_VERSION-linux-amd64
+export CORE_BUILD_MANIFEST="$CORE_BUNDLE/runtime/build-manifest.env"
+CORE_IMAGE_ID=$(docker image inspect --format '{{.Id}}' \
+  "rvc-orchestrator-worker:$RELEASE_VERSION")
+export CORE_IMAGE_ID
+CORE_MANIFEST_IMAGE_ID=$(python3 -c '
+import json, pathlib, sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+images = data["images"]
+assert len(images) == 1 and images[0]["role"] == "runtime"
+print(images[0]["image_id"])
+' "$CORE_BUNDLE/images-manifest.json")
+test "$CORE_IMAGE_ID" = "$CORE_MANIFEST_IMAGE_ID"
+```
+
+49-case GPU/no-network matrix와 reviewer evidence는 반드시 이 `CORE_IMAGE_ID`를 대상으로 한다. 모든
+case와 release review가 끝난 뒤에만 2단계 qualified factory를 실행한다.
+
+```bash
+installers/worker/build-qualified-release.sh \
+  --version "$RELEASE_VERSION" \
+  --runtime-image-id "$CORE_IMAGE_ID" \
+  --runtime-build-manifest "$CORE_BUILD_MANIFEST" \
+  --assets /offline/assets \
+  --asset-manifest /offline/assets/assets-manifest.json \
+  --qualification /offline/review/runtime-qualification.json \
+  --qualification-evidence /offline/review/runtime-evidence.tar.gz \
+  --output-dir "$QUALIFIED_OUTPUT_DIR"
+```
+
+2단계는 existing exact image와 build manifest/assets/qualification/evidence만 검증·재포장하며 image를
+build/pull/retag/remove하지 않는다. Core와 qualified archive basename은 같으므로 output directory를
+반드시 분리하고 기존 archive/sidecar를 덮어쓰지 않는다. Builder는 입력 activation boolean을 받지
+않고 검증된 증적에서 mode `0444` projection을 직접 만든다. 설치/start 시 exact image ID,
+asset/qualification/evidence hash와 고정 read-only mount를 다시 검증한다. 증적이 없으면 qualified
+factory를 실행하지 않고 core의 disabled projection과 세 false gate를 유지한다.
+
+Qualified archive도 vulnerability/container/secret scan, SBOM·license/redistribution 검토, 별도
+release reviewer attestation, clean Ubuntu 설치·재부팅·upgrade와 실제 외부 Manager/Object TLS/browser
+검증 전에는 production release가 아니다. 현재 실제 49-case/release 증적이 없으므로 모든 runtime
+gate는 false이며 qualified factory를 실행할 수 있는 승인 상태가 아니다.
 
 ## Manager backup과 restore
 

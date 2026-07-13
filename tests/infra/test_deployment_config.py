@@ -273,10 +273,19 @@ def test_release_images_receive_version_and_source_commit_labels() -> None:
 
 
 def test_self_contained_builders_require_release_source_ignore_closure() -> None:
-    for component in ("manager", "worker"):
-        builder = (ROOT / f"installers/{component}/build-bundle.sh").read_text(encoding="utf-8")
-        assert 'tools/verify_release_source.py" --repo-root "$REPO_ROOT"' in builder
-        assert "complete non-ignored source closure" in builder
+    manager_builder = (ROOT / "installers/manager/build-bundle.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'tools/verify_release_source.py" --repo-root "$REPO_ROOT"' in manager_builder
+    assert "complete non-ignored source closure" in manager_builder
+
+    worker_builder = (ROOT / "installers/worker/build-bundle.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'git -C "$REPO_ROOT" archive' in worker_builder
+    assert '"$committed_source/tools/verify_release_source.py"' in worker_builder
+    assert '--repo-root "$REPO_ROOT"' in worker_builder
+    assert "complete non-ignored source closure" in worker_builder
 
     for relative in (
         "infra/compose/manager.compose.build.yml",

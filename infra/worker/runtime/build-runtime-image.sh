@@ -24,6 +24,7 @@ asset_manifest=
 base_image=
 image_tag=
 output_manifest=
+output_image_id=
 verify_only=0
 
 while [[ $# -gt 0 ]]; do
@@ -37,6 +38,7 @@ while [[ $# -gt 0 ]]; do
     --base-image) shift; base_image=${1:?missing digest-pinned base image} ;;
     --tag) shift; image_tag=${1:?missing image tag} ;;
     --output-manifest) shift; output_manifest=${1:?missing output manifest path} ;;
+    --output-image-id) shift; output_image_id=${1:?missing output image ID path} ;;
     --verify-only) verify_only=1 ;;
     *) die "unknown runtime build option: $1" ;;
   esac
@@ -151,6 +153,13 @@ orchestrator_source_status=$(
 "$python_command" "$REPO_ROOT/tools/verify_release_source.py" --repo-root "$REPO_ROOT" || \
   die "runtime image builds require a complete non-ignored source closure"
 [[ ! -e $output_manifest ]] || die "output manifest already exists: $output_manifest"
+if [[ -n $output_image_id ]]; then
+  [[ ! -e $output_image_id && ! -L $output_image_id ]] || \
+    die "output image ID path already exists or is unsafe: $output_image_id"
+  output_image_id_directory=$(dirname "$output_image_id")
+  [[ -d $output_image_id_directory && ! -L $output_image_id_directory ]] || \
+    die "output image ID parent must be a real directory"
+fi
 command -v docker >/dev/null 2>&1 || die "Docker is required to build the runtime image"
 docker_architecture=$(docker info --format '{{.Architecture}}') || \
   die "Docker daemon architecture could not be inspected"
@@ -272,6 +281,19 @@ fi
   --tag "$image_tag" \
   --file "$context/Dockerfile" \
   "$context"
+
+built_image_id=$(docker image inspect --format '{{.Id}}' "$image_tag") || \
+  die "built runtime image ID could not be inspected"
+[[ $built_image_id =~ ^sha256:[0-9a-f]{64}$ ]] || \
+  die "built runtime image ID is not a SHA-256 digest"
+if [[ -n $output_image_id ]]; then
+  umask 077
+  temporary_image_id=$(mktemp \
+    "$output_image_id_directory/.rvc-runtime-image-id.XXXXXX")
+  printf '%s\n' "$built_image_id" > "$temporary_image_id"
+  chmod 0600 "$temporary_image_id"
+  mv "$temporary_image_id" "$output_image_id"
+fi
 
 for label_and_expected in \
   "org.opencontainers.image.version=$release_version" \
