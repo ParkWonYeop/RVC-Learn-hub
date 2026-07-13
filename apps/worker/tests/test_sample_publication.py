@@ -19,11 +19,13 @@ from rvc_orchestrator_contracts import (
     InferenceF0Method,
     InferencePresetConfig,
     JobClaim,
+    JobConfig,
     JobStatus,
     SampleMetricsEvidence,
     SampleMetricValues,
     SampleRead,
     SampleRegistrationRequest,
+    job_config_sha256,
 )
 from rvc_worker.agent import ActiveJob, WorkerAgent
 from rvc_worker.artifacts import sha256_file
@@ -794,6 +796,7 @@ def _sample_claim(*, build_index: bool = False) -> JobClaim:
         "inference_config_sha256": hashlib.sha256(canonical).hexdigest(),
         "items": items,
     }
+    payload["config_sha256"] = job_config_sha256(JobConfig.model_validate(payload["config"]))
     return JobClaim.model_validate(payload)
 
 

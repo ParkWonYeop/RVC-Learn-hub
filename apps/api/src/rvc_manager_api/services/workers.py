@@ -43,6 +43,7 @@ from ..models import (
     new_id,
 )
 from .datasets import dataset_ready_for_training
+from .job_configs import InvalidJobConfigLedger, validated_job_config
 from .test_sets import (
     build_sample_plan_document,
     build_test_set_manifest_document,
@@ -141,6 +142,11 @@ async def recover_expired_leases(
 
         previous = JobStatus(job.status)
         cancelled = job.cancel_requested_at is not None
+        try:
+            validated_job_config(job, attempt=attempt)
+            config_integrity_valid = True
+        except InvalidJobConfigLedger:
+            config_integrity_valid = False
         terminal = JobStatus.CANCELLED if cancelled else JobStatus.FAILED
         # Every leased execution state is required to admit failure/cancellation.
         # Validation here also fails closed if persisted state was corrupted.
@@ -150,8 +156,12 @@ async def recover_expired_leases(
         attempt.status = terminal.value
         attempt.finished_at = recovered_at
         if not cancelled:
-            attempt.error_code = "worker_lease_expired"
-            attempt.error_message = "Worker became offline and its Job lease expired"
+            if config_integrity_valid:
+                attempt.error_code = "worker_lease_expired"
+                attempt.error_message = "Worker became offline and its Job lease expired"
+            else:
+                attempt.error_code = "job_config_integrity_failed"
+                attempt.error_message = "Job configuration integrity could not be verified"
         session.add(
             JobStatusEvent(
                 job_id=job.id,
@@ -172,6 +182,7 @@ async def recover_expired_leases(
 
         auto_requeue = (
             not cancelled
+            and config_integrity_valid
             and settings.lease_recovery_max_attempts > 0
             and job.attempt_count < settings.lease_recovery_max_attempts
         )
@@ -219,6 +230,7 @@ async def recover_expired_leases(
                 "worker_id": worker.id,
                 "outcome": job.status,
                 "automatic_requeue": auto_requeue,
+                "job_config_integrity_valid": config_integrity_valid,
             },
         )
         recovered += 1
@@ -515,6 +527,54 @@ async def _verified_dataset_transfer(
     )
 
 
+async def _quarantine_invalid_queued_job_config(
+    session: AsyncSession,
+    job: Job,
+    *,
+    occurred_at: datetime,
+) -> bool:
+    """Remove a corrupt non-historical Job from the claim queue with a CAS."""
+
+    validate_job_transition(JobStatus.QUEUED, JobStatus.FAILED)
+    quarantined = await session.execute(
+        update(Job)
+        .where(
+            Job.id == job.id,
+            Job.status == JobStatus.QUEUED.value,
+            Job.row_version == job.row_version,
+            Job.config_sha256.is_not(None),
+        )
+        .values(
+            status=JobStatus.FAILED.value,
+            error_code="job_config_integrity_failed",
+            error_message="Job configuration integrity could not be verified",
+            updated_at=occurred_at,
+            row_version=job.row_version + 1,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if quarantined.rowcount != 1:  # type: ignore[attr-defined]
+        return False
+    session.add(
+        JobStatusEvent(
+            job_id=job.id,
+            previous_status=JobStatus.QUEUED.value,
+            status=JobStatus.FAILED.value,
+            occurred_at=occurred_at,
+            source="manager",
+        )
+    )
+    add_audit_event(
+        session,
+        actor_type="system",
+        action="job.config_integrity_quarantined",
+        resource_type="job",
+        resource_id=job.id,
+        details={"previous_status": JobStatus.QUEUED.value},
+    )
+    return True
+
+
 async def claim_job(
     session: AsyncSession,
     worker: Worker,
@@ -544,15 +604,32 @@ async def claim_job(
         (
             await session.scalars(
                 select(Job)
-                .where(Job.status == JobStatus.QUEUED.value)
+                .where(
+                    Job.status == JobStatus.QUEUED.value,
+                    Job.config_sha256.is_not(None),
+                )
                 .order_by(Job.priority.desc(), Job.created_at.asc(), Job.id.asc())
                 .limit(50)
             )
         ).all()
     )
     now = utc_now()
+    quarantined_invalid_config = False
     for job in candidates:
-        config = JobConfig.model_validate(job.config_json)
+        try:
+            config = validated_job_config(job)
+        except InvalidJobConfigLedger:
+            quarantined_invalid_config = (
+                await _quarantine_invalid_queued_job_config(
+                    session,
+                    job,
+                    occurred_at=now,
+                )
+                or quarantined_invalid_config
+            )
+            continue
+        config_sha256 = job.config_sha256
+        assert config_sha256 is not None
         if not worker_can_run(
             config,
             capabilities,
@@ -625,6 +702,7 @@ async def claim_job(
                     engine_mode=capabilities.engine_mode.value,
                     rvc_commit_hash=capabilities.rvc_commit_hash,
                     execution_provenance_version="worker-claim-v1",
+                    job_config_sha256=config_sha256,
                     runtime_image_digest=capabilities.runtime_image_digest,
                     runtime_asset_manifest_sha256=capabilities.runtime_asset_manifest_sha256,
                     status=JobStatus.ASSIGNED.value,
@@ -661,6 +739,7 @@ async def claim_job(
                 lease_id=lease_id,
                 lease_expires_at=expires_at,
                 config=config,
+                config_sha256=config_sha256,
                 dataset_transfer=dataset_transfer,
                 test_set_transfer=test_set_transfer,
             )
@@ -679,7 +758,10 @@ async def claim_job(
                 detail="worker or job changed during claim commit",
             ) from exc
         return response
-    await session.rollback()
+    if quarantined_invalid_config:
+        await session.commit()
+    else:
+        await session.rollback()
     return None
 
 
@@ -691,14 +773,18 @@ async def require_active_lease(
     lease_id: str,
     for_update: bool = False,
 ) -> JobLease:
-    statement = select(JobLease).where(
-        JobLease.id == lease_id,
-        JobLease.job_id == job_id,
-        JobLease.worker_id == worker_id,
-        JobLease.active.is_(True),
+    statement = (
+        select(JobLease)
+        .where(
+            JobLease.id == lease_id,
+            JobLease.job_id == job_id,
+            JobLease.worker_id == worker_id,
+            JobLease.active.is_(True),
+        )
+        .execution_options(populate_existing=True)
     )
     if for_update:
-        statement = statement.with_for_update().execution_options(populate_existing=True)
+        statement = statement.with_for_update()
     lease = await session.scalar(statement)
     if lease is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="invalid job lease")
@@ -708,4 +794,33 @@ async def require_active_lease(
         # attempt and clears both sides of the assignment atomically.
         await session.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="job lease expired")
+    job_statement = select(Job).where(Job.id == job_id).execution_options(populate_existing=True)
+    attempt_statement = (
+        select(JobAttempt)
+        .where(JobAttempt.id == lease.attempt_id)
+        .execution_options(populate_existing=True)
+    )
+    if for_update:
+        job_statement = job_statement.with_for_update()
+        attempt_statement = attempt_statement.with_for_update()
+    job = await session.scalar(job_statement)
+    attempt = await session.scalar(attempt_statement)
+    if (
+        job is None
+        or attempt is None
+        or job.current_attempt_id != attempt.id
+        or job.worker_id != worker_id
+        or attempt.worker_id != worker_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="job attempt is no longer current",
+        )
+    try:
+        validated_job_config(job, attempt=attempt)
+    except InvalidJobConfigLedger as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="job configuration integrity check failed",
+        ) from exc
     return lease

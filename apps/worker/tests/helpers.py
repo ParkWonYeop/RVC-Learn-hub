@@ -11,6 +11,7 @@ from rvc_orchestrator_contracts import (
     JobConfig,
     TestSetTransfer,
     TestSetTransferItem,
+    job_config_sha256,
     utc_now,
 )
 
@@ -72,9 +73,7 @@ def make_claim(**config_options: object) -> JobClaim:
                     test_set_item_id="test-item-1",
                     item_key="test-item-1",
                     sort_order=0,
-                    download_path=(
-                        "/api/v1/workers/jobs/job-1/test-set/items/test-item-1"
-                    ),
+                    download_path=("/api/v1/workers/jobs/job-1/test-set/items/test-item-1"),
                     filename="test-item-1.wav",
                     size_bytes=44,
                     sha256="3" * 64,
@@ -91,6 +90,7 @@ def make_claim(**config_options: object) -> JobClaim:
         lease_id="lease-1",
         lease_expires_at=utc_now() + timedelta(minutes=5),
         config=config,
+        config_sha256=job_config_sha256(config),
         dataset_transfer=DatasetTransfer(
             dataset_id="speaker-a-dataset",
             download_path="/api/v1/workers/jobs/job-1/dataset",

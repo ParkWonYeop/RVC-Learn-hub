@@ -18,6 +18,7 @@ from .job import (
     JobConfig,
     RVCVersion,
     TrainingF0Method,
+    job_config_sha256,
 )
 from .status import TERMINAL_JOB_STATUSES, JobStatus
 
@@ -368,6 +369,7 @@ class JobClaim(ContractModel):
     lease_id: str = Field(pattern=_SAFE_TRANSFER_ID)
     lease_expires_at: datetime
     config: JobConfig
+    config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     # Only non-production Fake Worker compatibility claims may omit this. Real
     # Workers always receive a verified transfer and fail closed without it.
     dataset_transfer: DatasetTransfer | None = None
@@ -375,6 +377,8 @@ class JobClaim(ContractModel):
 
     @model_validator(mode="after")
     def validate_dataset_transfer(self) -> JobClaim:
+        if job_config_sha256(self.config) != self.config_sha256:
+            raise ValueError("Job config hash does not match its snapshot")
         if (
             self.dataset_transfer is not None
             and self.dataset_transfer.dataset_id != self.config.dataset_id

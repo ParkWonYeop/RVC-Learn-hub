@@ -16,6 +16,7 @@ from rvc_orchestrator_contracts import (
     WorkerRegisterResponse,
     WorkerSessionResponse,
     WorkerStatus,
+    job_config_sha256,
     utc_now,
 )
 from rvc_worker.agent import (
@@ -481,11 +482,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
                 }.issubset(keys)
             )
             self.assertTrue(
-                all(
-                    entry.value == 1.0
-                    for entry in entries
-                    if entry.key == "system.gpu.count"
-                )
+                all(entry.value == 1.0 for entry in entries if entry.key == "system.gpu.count")
             )
             self.assertTrue(
                 all(
@@ -894,6 +891,27 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(runner.claim_validations, 0)
 
+    async def test_claim_rejects_config_mutation_after_wire_validation(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = FakeManager()
+            manager.claim.config.training.epochs += 1
+            runner = GuardedNativeRunner()
+            agent = WorkerAgent(
+                _settings(root, runner_mode="native"),
+                manager,
+                runner,
+                gpu_collector=VisibleGpuCollector(0),
+            )
+
+            await asyncio.wait_for(agent.run(max_jobs=1), timeout=5)
+
+            terminal = manager.status_updates[-1]
+            self.assertEqual(terminal.status, JobStatus.FAILED)
+            self.assertEqual(terminal.error_code, "worker_runtime_unready")
+            self.assertEqual(runner.claim_validations, 0)
+            self.assertFalse((root / "jobs").exists())
+
     async def test_claim_input_disk_requirement_and_below_boundary_fail_before_workspace(
         self,
     ) -> None:
@@ -998,6 +1016,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             manager = FakeManager()
             manager.claim = make_claim(samples=False)
             manager.claim.config.rvc_backend.rvc_commit_hash = "f" * 40
+            manager.claim.config_sha256 = job_config_sha256(manager.claim.config)
             runner = GuardedNativeRunner()
             agent = WorkerAgent(
                 _settings(Path(temporary), runner_mode="native"),
@@ -1063,9 +1082,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("argv", terminal.error_message)
             self.assertEqual(runner.calls, 1)
             self.assertEqual(terminal.telemetry_log_count, 0)
-            metric_entries = [
-                entry for batch in manager.metric_batches for entry in batch.entries
-            ]
+            metric_entries = [entry for batch in manager.metric_batches for entry in batch.entries]
             self.assertEqual(terminal.telemetry_metric_count, len(metric_entries))
             self.assertEqual(
                 {entry.key for entry in metric_entries},

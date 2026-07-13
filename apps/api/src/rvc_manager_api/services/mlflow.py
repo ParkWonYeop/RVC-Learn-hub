@@ -19,7 +19,8 @@ from rvc_orchestrator_contracts import JobStatus, MetricEntry, utc_now
 
 from ..config import Settings
 from ..database import Database
-from ..models import Artifact, Experiment, Job, MlflowSyncEvent
+from ..models import Artifact, Experiment, Job, JobAttempt, MlflowSyncEvent
+from .job_configs import InvalidJobConfigLedger, validated_job_config
 
 LOGGER = logging.getLogger("rvc_manager_api.mlflow")
 
@@ -147,15 +148,26 @@ def terminal_event_key(attempt_id: str, job_status: str) -> str:
     return f"terminal:{attempt_id}:{job_status}"
 
 
-def _job_context(job: Job, experiment: Experiment) -> dict[str, Any]:
+async def _job_context(
+    session: AsyncSession,
+    job: Job,
+    experiment: Experiment,
+    *,
+    attempt_id: str | None = None,
+) -> dict[str, Any]:
+    attempt = await session.get(JobAttempt, attempt_id) if attempt_id is not None else None
+    if attempt_id is not None and attempt is None:
+        raise InvalidJobConfigLedger("MLflow event references a missing Job attempt")
+    config = validated_job_config(job, attempt=attempt)
     return {
         "manager_experiment_id": experiment.id,
         "experiment_name": _safe_utf8(experiment.name),
         "job_id": job.id,
         "job_name": _safe_utf8(job.job_name),
         "dataset_id": job.dataset_id,
+        "config_sha256": job.config_sha256,
         "start_time_ms": _timestamp_ms(job.created_at),
-        "params": _flatten_params(job.config_json),
+        "params": _flatten_params(config.model_dump(mode="json")),
     }
 
 
@@ -604,7 +616,7 @@ class MlflowCoordinator:
             event_type=JOB_CREATED,
             aggregate_type="job",
             aggregate_id=job.id,
-            payload=_job_context(job, experiment),
+            payload=await _job_context(session, job, experiment),
         )
 
     async def enqueue_metric_batch(
@@ -620,7 +632,12 @@ class MlflowCoordinator:
         if not self.enabled:
             return None
         experiment = await _experiment_for_job(session, job)
-        payload = _job_context(job, experiment)
+        payload = await _job_context(
+            session,
+            job,
+            experiment,
+            attempt_id=attempt_id,
+        )
         payload.update(
             {
                 "attempt_id": attempt_id,
@@ -658,7 +675,12 @@ class MlflowCoordinator:
         if not self.enabled:
             return None
         experiment = await _experiment_for_job(session, job)
-        payload = _job_context(job, experiment)
+        payload = await _job_context(
+            session,
+            job,
+            experiment,
+            attempt_id=artifact.attempt_id,
+        )
         payload["artifact"] = {
             "id": artifact.id,
             "type": artifact.artifact_type,
@@ -688,7 +710,12 @@ class MlflowCoordinator:
         if not self.enabled:
             return None
         experiment = await _experiment_for_job(session, job)
-        payload = _job_context(job, experiment)
+        payload = await _job_context(
+            session,
+            job,
+            experiment,
+            attempt_id=attempt_id,
+        )
         payload.update(
             {
                 "attempt_id": attempt_id,

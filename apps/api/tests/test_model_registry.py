@@ -79,6 +79,8 @@ async def _register_real_worker_credentials(client: AsyncClient) -> tuple[str, s
 async def _create_experiment_job(
     client: AsyncClient,
     headers: dict[str, str],
+    *,
+    rvc_commit_hash: str | None = None,
 ) -> tuple[str, str]:
     prefix = new_id()
     dataset = await client.post(
@@ -100,16 +102,19 @@ async def _create_experiment_job(
         },
     )
     assert experiment.status_code == 201, experiment.text
+    job_payload = {
+        "job_name": f"registry-job-{prefix}",
+        "experiment_id": experiment.json()["id"],
+        "dataset_id": dataset.json()["id"],
+        "model": {"version": "v2", "sample_rate": "40k"},
+        "training": {"epochs": 10},
+    }
+    if rvc_commit_hash is not None:
+        job_payload["rvc_backend"] = {"rvc_commit_hash": rvc_commit_hash}
     job = await client.post(
         "/api/v1/jobs",
         headers=headers,
-        json={
-            "job_name": f"registry-job-{prefix}",
-            "experiment_id": experiment.json()["id"],
-            "dataset_id": dataset.json()["id"],
-            "model": {"version": "v2", "sample_rate": "40k"},
-            "training": {"epochs": 10},
-        },
+        json=job_payload,
     )
     assert job.status_code == 201, job.text
     return str(experiment.json()["id"]), str(job.json()["id"])
@@ -201,13 +206,13 @@ async def _seed_completed_attempt(
             engine_mode="rvc_webui",
             rvc_commit_hash=RVC_REVIEWED_COMMIT,
             execution_provenance_version="worker-claim-v1",
+            job_config_sha256=job.config_sha256,
             runtime_image_digest=IMAGE_DIGEST,
             runtime_asset_manifest_sha256=ASSET_SHA256,
             status="completed",
             started_at=now - timedelta(minutes=2),
             finished_at=now - timedelta(minutes=1),
         )
-
 
         session.add(attempt)
         await session.flush()
@@ -327,9 +332,7 @@ async def test_model_registry_candidate_promote_replay_and_revoke(
     admin_headers: dict[str, str],
     tmp_path: Path,
 ) -> None:
-    app.state.settings.sample_approved_runtime_bundles = (
-        f"{IMAGE_DIGEST}@{ASSET_SHA256}"
-    )
+    app.state.settings.sample_approved_runtime_bundles = f"{IMAGE_DIGEST}@{ASSET_SHA256}"
     experiment_id, job_id = await _create_experiment_job(client, admin_headers)
     attempt_id, model_id, index_id = await _seed_completed_attempt(
         app,
@@ -517,9 +520,7 @@ async def test_registry_rejects_legacy_provenance_and_oversized_body(
     admin_headers: dict[str, str],
     tmp_path: Path,
 ) -> None:
-    app.state.settings.sample_approved_runtime_bundles = (
-        f"{IMAGE_DIGEST}@{ASSET_SHA256}"
-    )
+    app.state.settings.sample_approved_runtime_bundles = f"{IMAGE_DIGEST}@{ASSET_SHA256}"
     experiment_id, job_id = await _create_experiment_job(client, admin_headers)
     attempt_id, model_id, _ = await _seed_completed_attempt(
         app,
@@ -593,9 +594,7 @@ async def test_registry_owner_admin_visibility_conceals_other_users(
     assert admin.status_code == 200
     assert hidden.status_code == 404
     assert hidden_mutation.status_code == 404
-    unauthenticated = await client.get(
-        f"/api/v1/experiments/{experiment_id}/model-registry"
-    )
+    unauthenticated = await client.get(f"/api/v1/experiments/{experiment_id}/model-registry")
     invalid = await client.post(
         f"/api/v1/experiments/{experiment_id}/model-registry/candidates",
         headers={**owner_headers, "Idempotency-Key": "invalid-registry-body"},
@@ -616,7 +615,15 @@ async def test_registry_owner_admin_visibility_conceals_other_users(
 
 @pytest.mark.parametrize(
     "variant",
-    ["fake", "running", "stale_current", "unapproved_runtime", "duplicate_model", "wrong_commit"],
+    [
+        "fake",
+        "running",
+        "stale_current",
+        "unapproved_runtime",
+        "duplicate_model",
+        "wrong_commit",
+        "missing_attempt_config_hash",
+    ],
 )
 async def test_registry_rejects_ineligible_candidate_ledgers(
     variant: str,
@@ -625,10 +632,12 @@ async def test_registry_rejects_ineligible_candidate_ledgers(
     admin_headers: dict[str, str],
     tmp_path: Path,
 ) -> None:
-    app.state.settings.sample_approved_runtime_bundles = (
-        f"{IMAGE_DIGEST}@{ASSET_SHA256}"
+    app.state.settings.sample_approved_runtime_bundles = f"{IMAGE_DIGEST}@{ASSET_SHA256}"
+    experiment_id, job_id = await _create_experiment_job(
+        client,
+        admin_headers,
+        rvc_commit_hash="0" * 40 if variant == "wrong_commit" else None,
     )
-    experiment_id, job_id = await _create_experiment_job(client, admin_headers)
     attempt_id, model_id, _ = await _seed_completed_attempt(
         app, client, tmp_path, job_id, include_index=False
     )
@@ -659,12 +668,8 @@ async def test_registry_rejects_ineligible_candidate_ledgers(
                     metadata_json={},
                 )
             )
-        elif variant == "wrong_commit":
-            document = dict(job.config_json)
-            backend = dict(document["rvc_backend"])
-            backend["rvc_commit_hash"] = "0" * 40
-            document["rvc_backend"] = backend
-            job.config_json = document
+        elif variant == "missing_attempt_config_hash":
+            attempt.job_config_sha256 = None
         await session.commit()
     response = await client.post(
         f"/api/v1/experiments/{experiment_id}/model-registry/candidates",
@@ -685,9 +690,7 @@ async def test_registry_active_replacement_rollback_and_candidate_revoke(
     admin_headers: dict[str, str],
     tmp_path: Path,
 ) -> None:
-    app.state.settings.sample_approved_runtime_bundles = (
-        f"{IMAGE_DIGEST}@{ASSET_SHA256}"
-    )
+    app.state.settings.sample_approved_runtime_bundles = f"{IMAGE_DIGEST}@{ASSET_SHA256}"
     experiment_id, first_job_id = await _create_experiment_job(client, admin_headers)
     second_job_id = await _create_additional_job(
         app,
@@ -726,8 +729,7 @@ async def test_registry_active_replacement_rollback_and_candidate_revoke(
     assert isinstance(first_entry, dict) and isinstance(second_entry, dict)
 
     promote_first = await client.post(
-        f"/api/v1/experiments/{experiment_id}/model-registry/entries/"
-        f"{first_entry['id']}/promote",
+        f"/api/v1/experiments/{experiment_id}/model-registry/entries/{first_entry['id']}/promote",
         headers={**admin_headers, "Idempotency-Key": "registry-promote-first"},
         json={
             "expected_registry_row_version": 2,
@@ -736,8 +738,7 @@ async def test_registry_active_replacement_rollback_and_candidate_revoke(
     )
     assert promote_first.status_code == 200, promote_first.text
     promote_second = await client.post(
-        f"/api/v1/experiments/{experiment_id}/model-registry/entries/"
-        f"{second_entry['id']}/promote",
+        f"/api/v1/experiments/{experiment_id}/model-registry/entries/{second_entry['id']}/promote",
         headers={**admin_headers, "Idempotency-Key": "registry-promote-second"},
         json={
             "expected_registry_row_version": 3,
@@ -757,8 +758,7 @@ async def test_registry_active_replacement_rollback_and_candidate_revoke(
     assert by_id[first_entry["id"]]["row_version"] == 3
 
     rollback = await client.post(
-        f"/api/v1/experiments/{experiment_id}/model-registry/entries/"
-        f"{first_entry['id']}/promote",
+        f"/api/v1/experiments/{experiment_id}/model-registry/entries/{first_entry['id']}/promote",
         headers={**admin_headers, "Idempotency-Key": "registry-rollback-first"},
         json={
             "expected_registry_row_version": 4,
@@ -772,8 +772,7 @@ async def test_registry_active_replacement_rollback_and_candidate_revoke(
     )
 
     revoke_active = await client.post(
-        f"/api/v1/experiments/{experiment_id}/model-registry/entries/"
-        f"{first_entry['id']}/revoke",
+        f"/api/v1/experiments/{experiment_id}/model-registry/entries/{first_entry['id']}/revoke",
         headers={**admin_headers, "Idempotency-Key": "registry-revoke-active"},
         json={
             "expected_registry_row_version": 5,
@@ -806,8 +805,7 @@ async def test_registry_active_replacement_rollback_and_candidate_revoke(
     third_entry = third["entry"]
     assert isinstance(third_entry, dict)
     revoke_candidate = await client.post(
-        f"/api/v1/experiments/{experiment_id}/model-registry/entries/"
-        f"{third_entry['id']}/revoke",
+        f"/api/v1/experiments/{experiment_id}/model-registry/entries/{third_entry['id']}/revoke",
         headers={**admin_headers, "Idempotency-Key": "registry-revoke-candidate"},
         json={
             "expected_registry_row_version": 7,
@@ -851,9 +849,7 @@ async def test_concurrent_promotion_has_one_winner_and_claim_snapshots_provenanc
     admin_headers: dict[str, str],
     tmp_path: Path,
 ) -> None:
-    app.state.settings.sample_approved_runtime_bundles = (
-        f"{IMAGE_DIGEST}@{ASSET_SHA256}"
-    )
+    app.state.settings.sample_approved_runtime_bundles = f"{IMAGE_DIGEST}@{ASSET_SHA256}"
     experiment_id, job_id = await _create_experiment_job(client, admin_headers)
     attempt_id, model_id, _ = await _seed_completed_attempt(
         app, client, tmp_path, job_id, include_index=False
@@ -870,10 +866,7 @@ async def test_concurrent_promotion_has_one_winner_and_claim_snapshots_provenanc
     )
     entry = candidate["entry"]
     assert isinstance(entry, dict)
-    url = (
-        f"/api/v1/experiments/{experiment_id}/model-registry/entries/"
-        f"{entry['id']}/promote"
-    )
+    url = f"/api/v1/experiments/{experiment_id}/model-registry/entries/{entry['id']}/promote"
     first, second = await asyncio.gather(
         client.post(
             url,
@@ -920,18 +913,14 @@ async def test_registry_canonical_tamper_and_storage_outage_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    app.state.settings.sample_approved_runtime_bundles = (
-        f"{IMAGE_DIGEST}@{ASSET_SHA256}"
-    )
+    app.state.settings.sample_approved_runtime_bundles = f"{IMAGE_DIGEST}@{ASSET_SHA256}"
     experiment_id, job_id = await _create_experiment_job(client, admin_headers)
     attempt_id, model_id, _ = await _seed_completed_attempt(
         app, client, tmp_path, job_id, include_index=False
     )
     async with app.state.database.session_factory() as session:
         upload = await session.scalar(
-            select(ArtifactUploadSession).where(
-                ArtifactUploadSession.artifact_id == model_id
-            )
+            select(ArtifactUploadSession).where(ArtifactUploadSession.artifact_id == model_id)
         )
         assert upload is not None
         canonical_key = upload.canonical_object_key
@@ -1012,9 +1001,7 @@ async def test_registry_get_rejects_mixed_version_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    app.state.settings.sample_approved_runtime_bundles = (
-        f"{IMAGE_DIGEST}@{ASSET_SHA256}"
-    )
+    app.state.settings.sample_approved_runtime_bundles = f"{IMAGE_DIGEST}@{ASSET_SHA256}"
     experiment_id, job_id = await _create_experiment_job(client, admin_headers)
     attempt_id, model_id, _ = await _seed_completed_attempt(
         app, client, tmp_path, job_id, include_index=False

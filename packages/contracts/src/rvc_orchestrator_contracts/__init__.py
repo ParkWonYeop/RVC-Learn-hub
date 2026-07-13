@@ -26,7 +26,9 @@ from .job import (
     TrainingConfig,
     TrainingF0Method,
     TrainingFeatureConfig,
+    canonical_job_config_bytes,
     feature_directory_for_version,
+    job_config_sha256,
 )
 from .sample import (
     RVC_REVIEWED_COMMIT,
@@ -144,7 +146,9 @@ __all__ = [
     "WorkerTokenRotationRequest",
     "WorkerTokenRotationStatus",
     "can_transition_job",
+    "canonical_job_config_bytes",
     "feature_directory_for_version",
+    "job_config_sha256",
     "utc_now",
     "validate_job_transition",
 ]

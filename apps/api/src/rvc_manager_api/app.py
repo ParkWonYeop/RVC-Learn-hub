@@ -42,6 +42,7 @@ from .routers import (
     user_router,
     worker_router,
 )
+from .services.artifact_cleanup import ArtifactCleanupReconciler
 from .services.maintenance import MaintenanceReconciler
 from .services.mlflow import (
     MlflowProjectionRequired,
@@ -74,11 +75,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if maintenance_queue is not None and resolved_settings.maintenance_reconcile_enabled
         else None
     )
+    artifact_cleanup_reconciler = (
+        ArtifactCleanupReconciler(database, storage, resolved_settings)
+        if resolved_settings.artifact_cleanup_reconcile_enabled
+        else None
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         mlflow_task: asyncio.Task[None] | None = None
         maintenance_reconcile_task: asyncio.Task[None] | None = None
+        artifact_cleanup_task: asyncio.Task[None] | None = None
         if resolved_settings.auto_create_schema:
             await database.create_all()
         if mlflow.enabled:
@@ -88,9 +95,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 maintenance_reconciler.run(),
                 name="maintenance-ledger-reconciler",
             )
+        if artifact_cleanup_reconciler is not None:
+            artifact_cleanup_task = asyncio.create_task(
+                artifact_cleanup_reconciler.run(),
+                name="artifact-cleanup-reconciler",
+            )
         try:
             yield
         finally:
+            if artifact_cleanup_reconciler is not None:
+                artifact_cleanup_reconciler.stop()
+            if artifact_cleanup_task is not None:
+                await artifact_cleanup_task
             if maintenance_reconciler is not None:
                 maintenance_reconciler.stop()
             if maintenance_reconcile_task is not None:
@@ -121,6 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.maintenance_queue = maintenance_queue
     app.state.rq_readiness = rq_readiness
     app.state.maintenance_reconciler = maintenance_reconciler
+    app.state.artifact_cleanup_reconciler = artifact_cleanup_reconciler
     app.state.sample_verification_semaphore = asyncio.Semaphore(
         resolved_settings.sample_verification_max_concurrency
     )

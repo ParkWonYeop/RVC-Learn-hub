@@ -4,6 +4,7 @@ import asyncio
 import errno
 import hashlib
 import io
+import uuid
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -20,10 +21,16 @@ from rvc_manager_api.models import (
     Artifact,
     ArtifactUploadSession,
     AuditEvent,
+    Job,
     JobLease,
     User,
 )
+from rvc_manager_api.routers.artifacts import _expire_upload
 from rvc_manager_api.security import hash_password
+from rvc_manager_api.services.artifact_cleanup import (
+    ArtifactCleanupReconciler,
+    reconcile_artifact_upload_cleanup,
+)
 from rvc_manager_api.services.artifacts import (
     ArtifactSpoolError,
     effective_artifact_upload_ttl_seconds,
@@ -235,8 +242,7 @@ async def test_artifact_namespace_mismatch_preserves_staging_and_blocks_download
     assert staging_path.is_file()
 
     finalized = await client.post(
-        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/"
-        f"{target['upload_session_id']}/finalize",
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/{target['upload_session_id']}/finalize",
         headers=worker_headers,
         json={"lease_id": claim["lease_id"], "attempt_id": claim["attempt_id"]},
     )
@@ -490,6 +496,338 @@ async def test_local_upload_finalize_idempotency_and_owner_download(
         assert "upload_url" not in persisted
 
 
+async def test_finalize_revalidates_config_after_canonical_publish_and_cleans_up(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_token = await register_worker(client, "artifact-config-fence-worker")
+    job_id, claim = await create_claim(
+        client,
+        admin_headers,
+        worker_token,
+        suffix="config-fence",
+    )
+    auth = {"Authorization": f"Bearer {worker_token}"}
+    content = b"artifact config fence" * 64
+    payload = init_payload(claim, content)
+    initialized = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
+        headers=auth,
+        json=payload,
+    )
+    assert initialized.status_code == 201, initialized.text
+    target = initialized.json()
+    assert (
+        await client.put(
+            target["upload_url"],
+            headers=target["upload_headers"],
+            content=content,
+        )
+    ).status_code == 204
+
+    original_store = app.state.storage.store_verified_file
+
+    async def store_then_tamper(*args: object, **kwargs: object) -> None:
+        await original_store(*args, **kwargs)
+        async with app.state.database.session_factory() as other_session:
+            job = await other_session.get(Job, job_id)
+            assert job is not None
+            document = dict(job.config_json)
+            artifacts = dict(document["artifacts"])
+            artifacts["collect_logs"] = not artifacts["collect_logs"]
+            document["artifacts"] = artifacts
+            job.config_json = document
+            await other_session.commit()
+
+    monkeypatch.setattr(app.state.storage, "store_verified_file", store_then_tamper)
+    finalized = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/{target['upload_session_id']}/finalize",
+        headers=auth,
+        json={"lease_id": claim["lease_id"], "attempt_id": claim["attempt_id"]},
+    )
+    assert finalized.status_code == 409
+    assert finalized.json()["detail"] == "job configuration integrity check failed"
+
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, target["upload_session_id"])
+        artifacts = list(
+            (await session.scalars(select(Artifact).where(Artifact.job_id == job_id))).all()
+        )
+        assert upload is not None
+        assert upload.status == "failed"
+        assert upload.failure_code == "job_config_integrity_failed"
+        assert upload.finalization_token is None
+        assert artifacts == []
+        canonical_path = app.state.storage.root / upload.canonical_object_key
+        assert canonical_path.is_file()
+        assert upload.canonical_cleanup_first_deleted_at is None
+        assert upload.canonical_cleanup_completed_at is None
+
+        upload.finalized_at = utc_now() - timedelta(
+            seconds=app.state.settings.artifact_finalizing_stale_seconds + 1
+        )
+        await session.commit()
+
+    first_cleanup = await reconcile_artifact_upload_cleanup(
+        app.state.database,
+        app.state.storage,
+        app.state.settings,
+        upload_ids=(target["upload_session_id"],),
+    )
+    assert first_cleanup.first_deletes == 1
+    assert not canonical_path.exists()
+
+    # A stale publisher that lost its DB token may finish after the first
+    # delete. Recreate the exact key and prove the confirmation pass removes it.
+    canonical_path.parent.mkdir(parents=True, exist_ok=True)
+    canonical_path.write_bytes(content)
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, target["upload_session_id"])
+        assert upload is not None
+        assert upload.canonical_cleanup_first_deleted_at is not None
+        assert upload.canonical_cleanup_completed_at is None
+        upload.canonical_cleanup_first_deleted_at = utc_now() - timedelta(
+            seconds=app.state.settings.artifact_cleanup_confirmation_grace_seconds + 1
+        )
+        await session.commit()
+
+    confirmed_cleanup = await reconcile_artifact_upload_cleanup(
+        app.state.database,
+        app.state.storage,
+        app.state.settings,
+        upload_ids=(target["upload_session_id"],),
+    )
+    assert confirmed_cleanup.confirmed_deletes == 1
+    assert not canonical_path.exists()
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, target["upload_session_id"])
+        assert upload is not None
+        assert upload.canonical_cleanup_completed_at is not None
+
+
+async def test_stale_finalizer_never_deletes_replacement_tokens_canonical_object(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_token = await register_worker(client, "artifact-token-fence-worker")
+    job_id, claim = await create_claim(
+        client,
+        admin_headers,
+        worker_token,
+        suffix="token-fence",
+    )
+    auth = {"Authorization": f"Bearer {worker_token}"}
+    content = b"artifact token ownership fence" * 64
+    initialized = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
+        headers=auth,
+        json=init_payload(claim, content),
+    )
+    assert initialized.status_code == 201, initialized.text
+    target = initialized.json()
+    upload_id = target["upload_session_id"]
+    assert (
+        await client.put(
+            target["upload_url"],
+            headers=target["upload_headers"],
+            content=content,
+        )
+    ).status_code == 204
+
+    replacement_token = str(uuid.uuid4())
+    original_store = app.state.storage.store_verified_file
+
+    async def publish_then_replace_owner(*args: object, **kwargs: object) -> None:
+        await original_store(*args, **kwargs)
+        async with app.state.database.session_factory() as other_session:
+            upload = await other_session.get(ArtifactUploadSession, upload_id)
+            assert upload is not None
+            assert upload.status == "finalizing"
+            upload.finalization_token = replacement_token
+            upload.updated_at = utc_now()
+            await other_session.commit()
+
+    monkeypatch.setattr(
+        app.state.storage,
+        "store_verified_file",
+        publish_then_replace_owner,
+    )
+    finalized = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/{upload_id}/finalize",
+        headers=auth,
+        json={"lease_id": claim["lease_id"], "attempt_id": claim["attempt_id"]},
+    )
+    assert finalized.status_code == 409
+    assert finalized.json()["detail"] == "upload finalization ownership changed"
+
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, upload_id)
+        assert upload is not None
+        assert upload.status == "finalizing"
+        assert upload.finalization_token == replacement_token
+        assert (app.state.storage.root / upload.canonical_object_key).is_file()
+        assert (app.state.storage.root / upload.temporary_object_key).is_file()
+
+
+async def test_local_upload_writer_is_single_owner_and_sealed_before_finalize(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_token = await register_worker(client, "artifact-write-fence-worker")
+    job_id, claim = await create_claim(
+        client,
+        admin_headers,
+        worker_token,
+        suffix="write-fence",
+    )
+    auth = {"Authorization": f"Bearer {worker_token}"}
+    content = b"single owner upload body" * 64
+    initialized = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
+        headers=auth,
+        json=init_payload(claim, content),
+    )
+    assert initialized.status_code == 201, initialized.text
+    target = initialized.json()
+
+    unsealed = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/{target['upload_session_id']}/finalize",
+        headers=auth,
+        json={"lease_id": claim["lease_id"], "attempt_id": claim["attempt_id"]},
+    )
+    assert unsealed.status_code == 409
+    assert unsealed.json()["detail"] == "local upload is not sealed"
+
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+    original_write = app.state.storage.write_upload_stream
+
+    async def delayed_write(*args: object, **kwargs: object) -> None:
+        write_started.set()
+        await release_write.wait()
+        await original_write(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.storage, "write_upload_stream", delayed_write)
+    first_write = asyncio.create_task(
+        client.put(
+            target["upload_url"],
+            headers=target["upload_headers"],
+            content=content,
+        )
+    )
+    await asyncio.wait_for(write_started.wait(), timeout=2)
+
+    concurrent_write = await client.put(
+        target["upload_url"],
+        headers=target["upload_headers"],
+        content=content,
+    )
+    assert concurrent_write.status_code == 409
+    assert concurrent_write.json()["detail"] == "upload session write is active"
+    concurrent_finalize = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/{target['upload_session_id']}/finalize",
+        headers=auth,
+        json={"lease_id": claim["lease_id"], "attempt_id": claim["attempt_id"]},
+    )
+    assert concurrent_finalize.status_code == 409
+    assert concurrent_finalize.json()["detail"] == "upload session write is active"
+
+    release_write.set()
+    assert (await first_write).status_code == 204
+    replay_write = await client.put(
+        target["upload_url"],
+        headers=target["upload_headers"],
+        content=content,
+    )
+    assert replay_write.status_code == 409
+    assert replay_write.json()["detail"] == "upload session is already sealed"
+
+    finalized = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/{target['upload_session_id']}/finalize",
+        headers=auth,
+        json={"lease_id": claim["lease_id"], "attempt_id": claim["attempt_id"]},
+    )
+    assert finalized.status_code == 200, finalized.text
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, target["upload_session_id"])
+        assert upload is not None
+        assert upload.status == "completed"
+        assert upload.upload_write_token is None
+        assert upload.upload_heartbeat_at is None
+        assert upload.staging_cleanup_completed_at is not None
+
+
+async def test_expiry_cas_never_overwrites_a_replacement_finalizer(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    worker_token = await register_worker(client, "artifact-expiry-fence-worker")
+    job_id, claim = await create_claim(
+        client,
+        admin_headers,
+        worker_token,
+        suffix="expiry-fence",
+    )
+    content = b"expiry fence staging body"
+    initialized = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
+        headers={"Authorization": f"Bearer {worker_token}"},
+        json=init_payload(claim, content),
+    )
+    target = initialized.json()
+    assert (
+        await client.put(
+            target["upload_url"],
+            headers=target["upload_headers"],
+            content=content,
+        )
+    ).status_code == 204
+
+    replacement_token = str(uuid.uuid4())
+    async with app.state.database.session_factory() as expiry_session:
+        stale_upload = await expiry_session.get(
+            ArtifactUploadSession,
+            target["upload_session_id"],
+        )
+        assert stale_upload is not None
+        stale_upload.expires_at = utc_now() - timedelta(seconds=1)
+        await expiry_session.commit()
+        expiry_session.expunge(stale_upload)
+
+        async with app.state.database.session_factory() as finalizer_session:
+            replacement = await finalizer_session.get(
+                ArtifactUploadSession,
+                target["upload_session_id"],
+            )
+            assert replacement is not None
+            replacement.status = "finalizing"
+            replacement.finalization_token = replacement_token
+            await finalizer_session.commit()
+
+        expired = await _expire_upload(
+            stale_upload,
+            database=app.state.database,
+            storage=app.state.storage,
+            settings=app.state.settings,
+            session=expiry_session,
+        )
+        assert expired is False
+
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, target["upload_session_id"])
+        assert upload is not None
+        assert upload.status == "finalizing"
+        assert upload.finalization_token == replacement_token
+        assert (app.state.storage.root / upload.temporary_object_key).is_file()
+
+
 def test_upload_ttl_scales_to_single_put_size_and_respects_operator_cap() -> None:
     settings = Settings(
         environment="test",
@@ -561,9 +899,7 @@ async def test_spool_cancellation_closes_handle_and_removes_partial_file(
         await keep_stream_open.wait()
 
     monkeypatch.setattr(app.state.storage, "stream_object", stalled_stream)
-    settings = app.state.settings.model_copy(
-        update={"artifact_verification_spool_dir": tmp_path}
-    )
+    settings = app.state.settings.model_copy(update={"artifact_verification_spool_dir": tmp_path})
     verification = asyncio.create_task(
         verify_object_to_spool(
             app.state.storage,
@@ -780,7 +1116,7 @@ async def test_expired_idempotent_upload_creates_a_new_generation(
         assert uploads[1].expires_at > lease.expires_at
 
 
-async def test_attempt_session_quota_is_idempotent_and_excludes_failed_sessions(
+async def test_attempt_session_quota_counts_failed_sessions_until_cleanup_completes(
     app: FastAPI,
     client: AsyncClient,
     admin_headers: dict[str, str],
@@ -832,6 +1168,20 @@ async def test_attempt_session_quota_is_idempotent_and_excludes_failed_sessions(
         upload.failure_code = "test_terminal_failure"
         upload.dedupe_key = None
         await session.commit()
+    cleanup_pending = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
+        headers=auth,
+        json=second_payload,
+    )
+    assert cleanup_pending.status_code == 409
+    assert cleanup_pending.json()["detail"] == "artifact session quota exceeded"
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, first.json()["upload_session_id"])
+        assert upload is not None
+        cleaned_at = utc_now()
+        upload.staging_cleanup_completed_at = cleaned_at
+        upload.canonical_cleanup_completed_at = cleaned_at
+        await session.commit()
     accepted = await client.post(
         f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
         headers=auth,
@@ -840,7 +1190,7 @@ async def test_attempt_session_quota_is_idempotent_and_excludes_failed_sessions(
     assert accepted.status_code == 201, accepted.text
 
 
-async def test_attempt_byte_quota_counts_only_current_valid_sessions(
+async def test_attempt_byte_quota_counts_expired_sessions_until_cleanup_completes(
     app: FastAPI,
     client: AsyncClient,
     admin_headers: dict[str, str],
@@ -886,6 +1236,20 @@ async def test_attempt_byte_quota_counts_only_current_valid_sessions(
         upload.status = "expired"
         upload.failure_code = "upload_expired"
         upload.dedupe_key = None
+        await session.commit()
+    cleanup_pending = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
+        headers=auth,
+        json=second_payload,
+    )
+    assert cleanup_pending.status_code == 409
+    assert cleanup_pending.json()["detail"] == "artifact byte quota exceeded"
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, first.json()["upload_session_id"])
+        assert upload is not None
+        cleaned_at = utc_now()
+        upload.staging_cleanup_completed_at = cleaned_at
+        upload.canonical_cleanup_completed_at = cleaned_at
         await session.commit()
     accepted = await client.post(
         f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
@@ -966,6 +1330,217 @@ async def test_checksum_mismatch_cleans_temporary_object_and_never_creates_artif
     assert retried.status_code == 201
     assert retried.json()["status"] == "pending"
     assert retried.json()["upload_session_id"] != target["upload_session_id"]
+
+
+async def test_cleanup_reconciler_retries_local_failure_and_releases_quota(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app.state.settings.artifact_attempt_max_sessions = 1
+    worker_token = await register_worker(client, "artifact-cleanup-retry-worker")
+    job_id, claim = await create_claim(
+        client,
+        admin_headers,
+        worker_token,
+        suffix="cleanup-retry",
+    )
+    auth = {"Authorization": f"Bearer {worker_token}"}
+    content = b"cleanup retry staging object"
+    initialized = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
+        headers=auth,
+        json=init_payload(claim, content),
+    )
+    assert initialized.status_code == 201, initialized.text
+    target = initialized.json()
+    assert (
+        await client.put(
+            target["upload_url"],
+            headers=target["upload_headers"],
+            content=content,
+        )
+    ).status_code == 204
+
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, target["upload_session_id"])
+        assert upload is not None
+        upload.status = "failed"
+        upload.failure_code = "test_terminal_failure"
+        upload.dedupe_key = None
+        upload.finalized_at = utc_now()
+        upload.canonical_cleanup_completed_at = utc_now()
+        await session.commit()
+
+    second_payload = init_payload(claim, b"second cleanup artifact")
+    second_payload.update(
+        {
+            "idempotency_key": "artifact-cleanup-retry-0002",
+            "artifact_type": "final_index",
+            "filename": "final.index",
+        }
+    )
+    blocked = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
+        headers=auth,
+        json=second_payload,
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == "artifact session quota exceeded"
+
+    original_delete = app.state.storage.delete_object
+
+    async def fail_delete(_object_key: str) -> None:
+        raise StorageError("injected cleanup outage")
+
+    monkeypatch.setattr(app.state.storage, "delete_object", fail_delete)
+    failed_cleanup = await reconcile_artifact_upload_cleanup(
+        app.state.database,
+        app.state.storage,
+        app.state.settings,
+        upload_ids=(target["upload_session_id"],),
+    )
+    assert failed_cleanup.failed == 1
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, target["upload_session_id"])
+        assert upload is not None
+        assert upload.cleanup_token is None
+        assert upload.staging_cleanup_completed_at is None
+        assert upload.failure_code == "cleanup_failed"
+
+    monkeypatch.setattr(app.state.storage, "delete_object", original_delete)
+    retried_cleanup = await reconcile_artifact_upload_cleanup(
+        app.state.database,
+        app.state.storage,
+        app.state.settings,
+        upload_ids=(target["upload_session_id"],),
+    )
+    assert retried_cleanup.confirmed_deletes == 1
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, target["upload_session_id"])
+        assert upload is not None
+        assert upload.staging_cleanup_first_deleted_at is not None
+        assert upload.staging_cleanup_completed_at is not None
+
+    accepted = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
+        headers=auth,
+        json=second_payload,
+    )
+    assert accepted.status_code == 201, accepted.text
+
+
+@pytest.mark.parametrize(
+    ("tampered_field", "completed_field"),
+    [
+        ("temporary_object_key", "canonical_cleanup_completed_at"),
+        ("canonical_object_key", "staging_cleanup_completed_at"),
+    ],
+)
+async def test_cleanup_reconciler_rejects_reconstructed_object_key_mismatch(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+    tampered_field: str,
+    completed_field: str,
+) -> None:
+    worker_token = await register_worker(client, f"artifact-cleanup-key-{tampered_field}")
+    job_id, claim = await create_claim(
+        client,
+        admin_headers,
+        worker_token,
+        suffix=f"cleanup-key-{tampered_field}",
+    )
+    auth = {"Authorization": f"Bearer {worker_token}"}
+    content = b"cleanup key integrity object"
+    initialized = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
+        headers=auth,
+        json=init_payload(claim, content),
+    )
+    assert initialized.status_code == 201, initialized.text
+    target = initialized.json()
+    assert (
+        await client.put(
+            target["upload_url"],
+            headers=target["upload_headers"],
+            content=content,
+        )
+    ).status_code == 204
+
+    upload_id = target["upload_session_id"]
+    foreign_key = f"artifacts/staging/{claim['attempt_id']}/foreign-{upload_id}"
+    if tampered_field == "canonical_object_key":
+        foreign_key = (
+            f"artifacts/verified/{job_id}/{claim['attempt_id']}/"
+            f"final_small_model/foreign-{upload_id}"
+        )
+    foreign_path = app.state.storage.root / foreign_key
+    foreign_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    foreign_path.write_bytes(b"must not be deleted")
+
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, upload_id)
+        assert upload is not None
+        upload.status = "failed"
+        upload.failure_code = "test_terminal_failure"
+        upload.dedupe_key = None
+        upload.finalized_at = utc_now() - timedelta(
+            seconds=app.state.settings.artifact_finalizing_stale_seconds + 1
+        )
+        setattr(upload, tampered_field, foreign_key)
+        setattr(upload, completed_field, utc_now())
+        await session.commit()
+
+    result = await reconcile_artifact_upload_cleanup(
+        app.state.database,
+        app.state.storage,
+        app.state.settings,
+        upload_ids=(upload_id,),
+    )
+    assert result.failed == 1
+    assert result.object_deletes == 0
+    assert foreign_path.read_bytes() == b"must not be deleted"
+    async with app.state.database.session_factory() as session:
+        upload = await session.get(ArtifactUploadSession, upload_id)
+        assert upload is not None
+        assert upload.failure_code == "cleanup_key_mismatch"
+        assert upload.cleanup_token is None
+        if tampered_field == "temporary_object_key":
+            assert upload.staging_cleanup_completed_at is None
+        else:
+            assert upload.canonical_cleanup_completed_at is None
+
+
+async def test_production_readiness_fails_when_artifact_cleanup_is_disabled(
+    app: FastAPI,
+    client: AsyncClient,
+) -> None:
+    app.state.settings.environment = "production"
+    app.state.settings.artifact_cleanup_reconcile_enabled = False
+    response = await client.get("/ready")
+    assert response.status_code == 503
+    assert response.json()["checks"]["artifact_cleanup_reconciler"] == "disabled"
+
+
+async def test_cleanup_reconciler_background_loop_reports_readiness(app: FastAPI) -> None:
+    app.state.settings.artifact_cleanup_reconcile_interval_seconds = 0.01
+    app.state.settings.artifact_cleanup_reconcile_stale_seconds = 1
+    reconciler = ArtifactCleanupReconciler(
+        app.state.database,
+        app.state.storage,
+        app.state.settings,
+    )
+    task = asyncio.create_task(reconciler.run())
+    try:
+        await asyncio.sleep(0.05)
+        assert reconciler.last_completed_at is not None
+        assert reconciler.readiness() == ("ok", True)
+    finally:
+        reconciler.stop()
+        await asyncio.wait_for(task, timeout=1)
+    assert reconciler.readiness() == ("stopped", False)
 
 
 async def test_upload_rejects_foreign_and_expired_lease_and_unsafe_filename(
@@ -1060,6 +1635,104 @@ class FakeS3Client:
         return None
 
 
+async def test_s3_staging_cleanup_requires_confirmed_second_delete(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    worker_token = await register_worker(client, "artifact-s3-cleanup-worker")
+    job_id, claim = await create_claim(
+        client,
+        admin_headers,
+        worker_token,
+        suffix="s3-cleanup",
+    )
+    content = b"s3 cleanup fence"
+    initialized = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/artifact-uploads/init",
+        headers={"Authorization": f"Bearer {worker_token}"},
+        json=init_payload(claim, content),
+    )
+    assert initialized.status_code == 201, initialized.text
+    upload_id = initialized.json()["upload_session_id"]
+
+    s3_settings = Settings(
+        environment="test",
+        storage_backend="s3",
+        s3_endpoint_url="https://minio.example.test",
+        s3_access_key_id="access-key",
+        s3_secret_access_key="secret-key",
+        s3_bucket="artifact-cleanup-bucket",
+        jwt_secret="test-jwt-secret-with-at-least-thirty-two-characters",
+    )
+    fake_client = FakeS3Client(content)
+    adapter = S3StorageAdapter(s3_settings, client=fake_client)
+    try:
+        async with app.state.database.session_factory() as session:
+            upload = await session.get(ArtifactUploadSession, upload_id)
+            assert upload is not None
+            temporary_object_key = upload.temporary_object_key
+            upload.status = "completed"
+            upload.storage_backend = adapter.backend
+            upload.storage_namespace_sha256 = adapter.namespace_fingerprint
+            upload.expires_at = utc_now()
+            upload.finalized_at = utc_now()
+            await session.commit()
+
+        deferred = await reconcile_artifact_upload_cleanup(
+            app.state.database,
+            adapter,
+            app.state.settings,
+            upload_ids=(upload_id,),
+        )
+        assert deferred.examined == 0
+        assert fake_client.deletes == []
+        async with app.state.database.session_factory() as session:
+            upload = await session.get(ArtifactUploadSession, upload_id)
+            assert upload is not None
+            upload.expires_at = utc_now() - timedelta(
+                seconds=app.state.settings.artifact_staging_cleanup_grace_seconds + 1
+            )
+            await session.commit()
+
+        first = await reconcile_artifact_upload_cleanup(
+            app.state.database,
+            adapter,
+            app.state.settings,
+            upload_ids=(upload_id,),
+        )
+        assert first.first_deletes == 1
+        assert first.confirmed_deletes == 0
+        assert fake_client.deletes == [temporary_object_key]
+        async with app.state.database.session_factory() as session:
+            upload = await session.get(ArtifactUploadSession, upload_id)
+            assert upload is not None
+            assert upload.staging_cleanup_first_deleted_at is not None
+            assert upload.staging_cleanup_completed_at is None
+            upload.staging_cleanup_first_deleted_at = utc_now() - timedelta(
+                seconds=app.state.settings.artifact_cleanup_confirmation_grace_seconds + 1
+            )
+            await session.commit()
+
+        # A PUT authorized before URL expiry may finish after the first delete.
+        # The confirmation pass deletes that possible resurrection as well.
+        confirmed = await reconcile_artifact_upload_cleanup(
+            app.state.database,
+            adapter,
+            app.state.settings,
+            upload_ids=(upload_id,),
+        )
+        assert confirmed.confirmed_deletes == 1
+        assert fake_client.deletes == [temporary_object_key, temporary_object_key]
+        async with app.state.database.session_factory() as session:
+            upload = await session.get(ArtifactUploadSession, upload_id)
+            assert upload is not None
+            assert upload.staging_cleanup_completed_at is not None
+            assert upload.cleanup_token is None
+    finally:
+        await adapter.close()
+
+
 async def test_s3_namespace_ignores_credentials_but_tracks_object_namespace() -> None:
     base = {
         "environment": "test",
@@ -1132,12 +1805,14 @@ async def test_s3_adapter_presigns_bound_headers_and_streams_without_external_s3
     )
     assert "signature=secret" in target.url
     assert target.headers["Content-Length"] == str(len(content))
+    assert target.headers["If-None-Match"] == "*"
     assert target.headers["x-amz-meta-sha256"] == sha256
     assert "x-amz-checksum-sha256" in target.headers
     operation, arguments = fake_client.presigns[0]
     assert operation == "put_object"
     assert arguments["Params"]["Key"] == "artifacts/staging/attempt/session"
     assert arguments["Params"]["ContentLength"] == len(content)
+    assert arguments["Params"]["IfNoneMatch"] == "*"
     assert arguments["Params"]["Metadata"] == {"sha256": sha256}
 
     streamed = b"".join(

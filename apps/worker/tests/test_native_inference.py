@@ -14,7 +14,13 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import Any
 
-from rvc_orchestrator_contracts import InferencePresetConfig, JobClaim, JobStatus
+from rvc_orchestrator_contracts import (
+    InferencePresetConfig,
+    JobClaim,
+    JobConfig,
+    JobStatus,
+    job_config_sha256,
+)
 from rvc_worker.native_inference import (
     NativeCrepeModelEvidence,
     NativeFixedTestSetInferenceDependency,
@@ -787,6 +793,7 @@ def _sample_claim(
             "duration_seconds": 0.01,
         }
     )
+    payload["config_sha256"] = job_config_sha256(JobConfig.model_validate(payload["config"]))
     return JobClaim.model_validate(payload)
 
 

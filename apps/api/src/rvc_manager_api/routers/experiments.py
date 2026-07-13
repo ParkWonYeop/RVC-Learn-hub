@@ -15,6 +15,7 @@ from rvc_orchestrator_contracts import (
     JobConfig,
     JobStatus,
     WorkerEngineMode,
+    job_config_sha256,
     utc_now,
     validate_job_transition,
 )
@@ -47,6 +48,7 @@ from ..services.experiment_comparison import (
     InvalidExperimentComparisonLedger,
     build_experiment_comparison_jobs,
 )
+from ..services.job_configs import InvalidJobConfigLedger, validated_job_config
 from ..services.test_sets import (
     build_sample_plan_document,
     build_test_set_manifest_document,
@@ -89,8 +91,38 @@ def require_owner_or_admin(user: User, owner_id: str | None, resource: str) -> N
 def job_to_schema(
     job: Job,
     *,
-    current_attempt_engine_mode: WorkerEngineMode | None,
+    current_attempt: JobAttempt | None,
 ) -> JobRead:
+    try:
+        if job.current_attempt_id is None:
+            if current_attempt is not None:
+                raise InvalidJobConfigLedger(
+                    "Job without a current attempt received attempt evidence"
+                )
+            # Historical pre-ledger Jobs remain readable only while they have
+            # no current attempt.  They cannot supply execution evidence.
+            config = (
+                JobConfig.model_validate(job.config_json)
+                if job.config_sha256 is None
+                else validated_job_config(job)
+            )
+            current_attempt_engine_mode = None
+        else:
+            if (
+                current_attempt is None
+                or current_attempt.id != job.current_attempt_id
+                or current_attempt.job_id != job.id
+            ):
+                raise InvalidJobConfigLedger(
+                    "Job current attempt does not match the attempt ledger"
+                )
+            config = validated_job_config(job, attempt=current_attempt)
+            current_attempt_engine_mode = WorkerEngineMode(current_attempt.engine_mode)
+    except (InvalidJobConfigLedger, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="job configuration integrity check failed",
+        ) from exc
     return JobRead(
         id=job.id,
         experiment_id=job.experiment_id,
@@ -98,7 +130,8 @@ def job_to_schema(
         worker_id=job.worker_id,
         job_name=job.job_name,
         status=JobStatus(job.status),
-        config=JobConfig.model_validate(job.config_json),
+        config=config,
+        config_sha256=job.config_sha256,
         test_set_id=job.test_set_id,
         preset_id=job.preset_id,
         sample_plan_sha256=job.sample_plan_sha256,
@@ -126,27 +159,30 @@ async def _jobs_to_schema(session: SessionDep, jobs: Sequence[Job]) -> list[JobR
     both the attempt and Job identities to match before exposing the mode.
     """
 
-    expected_jobs_by_attempt = {
-        job.current_attempt_id: job.id for job in jobs if job.current_attempt_id is not None
+    current_attempt_ids = {
+        job.current_attempt_id for job in jobs if job.current_attempt_id is not None
     }
-    modes_by_job: dict[str, WorkerEngineMode] = {}
-    if expected_jobs_by_attempt:
-        rows = (
-            await session.execute(
-                select(JobAttempt.id, JobAttempt.job_id, JobAttempt.engine_mode).where(
-                    JobAttempt.id.in_(tuple(expected_jobs_by_attempt))
+    attempts_by_id: dict[str, JobAttempt] = {}
+    if current_attempt_ids:
+        attempts = list(
+            (
+                await session.scalars(
+                    select(JobAttempt)
+                    .where(JobAttempt.id.in_(tuple(current_attempt_ids)))
+                    .execution_options(populate_existing=True)
                 )
-            )
-        ).all()
-        for attempt_id, attempt_job_id, raw_engine_mode in rows:
-            if expected_jobs_by_attempt.get(attempt_id) != attempt_job_id:
-                continue
-            modes_by_job[attempt_job_id] = WorkerEngineMode(raw_engine_mode)
+            ).all()
+        )
+        attempts_by_id = {attempt.id: attempt for attempt in attempts}
 
     return [
         job_to_schema(
             job,
-            current_attempt_engine_mode=modes_by_job.get(job.id),
+            current_attempt=(
+                attempts_by_id.get(job.current_attempt_id)
+                if job.current_attempt_id is not None
+                else None
+            ),
         )
         for job in jobs
     ]
@@ -567,12 +603,15 @@ async def create_job(
         )
         sample_plan_sha256 = canonical_sha256(sample_plan)
         test_set_id = test_set.id
+    config_document = config.model_dump(mode="json")
+    config_sha256 = job_config_sha256(config_document)
     job = Job(
         experiment_id=experiment.id,
         dataset_id=experiment.dataset_id,
         job_name=config.job_name,
         status=JobStatus.QUEUED.value,
-        config_json=config.model_dump(mode="json"),
+        config_json=config_document,
+        config_sha256=config_sha256,
         test_set_id=test_set_id,
         preset_id=None,
         sample_plan_json=sample_plan,
@@ -605,6 +644,7 @@ async def create_job(
         resource_type="job",
         resource_id=job.id,
         details={
+            "config_sha256": config_sha256,
             "test_set_id": test_set_id,
             "sample_plan_sha256": sample_plan_sha256,
         },
@@ -726,6 +766,20 @@ async def retry_job(job_id: str, session: SessionDep, user: CurrentUserDep) -> J
     require_owner_or_admin(user, experiment.created_by, "job")
     if JobStatus(job.status) is not JobStatus.FAILED:
         raise HTTPException(status_code=409, detail="only failed jobs can be retried")
+    attempt = (
+        await session.get(JobAttempt, job.current_attempt_id)
+        if job.current_attempt_id is not None
+        else None
+    )
+    try:
+        if attempt is None:
+            raise InvalidJobConfigLedger("failed Job has no current attempt snapshot")
+        validated_job_config(job, attempt=attempt)
+    except InvalidJobConfigLedger as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="job configuration integrity check failed",
+        ) from exc
     now = utc_now()
     validate_job_transition(JobStatus.FAILED, JobStatus.RETRYING)
     session.add(

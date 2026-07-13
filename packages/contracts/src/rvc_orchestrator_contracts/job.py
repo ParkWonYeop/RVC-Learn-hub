@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import re
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
@@ -195,6 +199,13 @@ class ResourceRequirements(ContractModel):
     preferred_worker_tags: list[str] = Field(default_factory=list, max_length=64)
     priority: int = Field(default=5, ge=0, le=10)
 
+    @field_validator("min_vram_gb")
+    @classmethod
+    def finite_min_vram(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("minimum VRAM must be finite")
+        return value
+
     @field_validator("preferred_worker_tags")
     @classmethod
     def unique_tags(cls, value: list[str]) -> list[str]:
@@ -267,3 +278,33 @@ class JobConfig(ContractModel):
     @property
     def feature_directory(self) -> str:
         return feature_directory_for_version(self.model.version)
+
+
+def canonical_job_config_bytes(config: JobConfig | Mapping[str, object]) -> bytes:
+    """Return the one canonical byte representation used for JobConfig evidence."""
+
+    document = config.model_dump(mode="json") if isinstance(config, JobConfig) else dict(config)
+
+    def normalize_json_value(value: object) -> object:
+        # PostgreSQL JSONB does not preserve the sign of numeric zero. Collapse
+        # every floating-point zero before hashing so create-time bytes and a
+        # later database round trip have exactly the same evidence digest.
+        if isinstance(value, float) and value == 0.0:
+            return 0.0
+        if isinstance(value, Mapping):
+            return {key: normalize_json_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [normalize_json_value(item) for item in value]
+        return value
+
+    return json.dumps(
+        normalize_json_value(document),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def job_config_sha256(config: JobConfig | Mapping[str, object]) -> str:
+    return hashlib.sha256(canonical_job_config_bytes(config)).hexdigest()

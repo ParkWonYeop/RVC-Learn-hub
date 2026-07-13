@@ -29,6 +29,12 @@ from ..schemas import (
     ExperimentComparisonSampleRead,
 )
 from ..storage import StorageAdapter
+from .job_configs import (
+    InvalidJobConfigLedger,
+)
+from .job_configs import (
+    validated_job_config as validate_job_config_ledger,
+)
 from .samples import (
     SampleStorageUnavailable,
     VerifiedArtifactBinding,
@@ -106,9 +112,16 @@ def _contains_non_finite(value: object) -> bool:
 def _job_fingerprint(job: Job) -> tuple[object, ...]:
     return (
         job.row_version,
+        job.job_name,
+        job.experiment_id,
+        job.dataset_id,
         job.status,
         job.worker_id,
         job.current_attempt_id,
+        job.config_json,
+        job.config_sha256,
+        job.test_set_id,
+        job.priority,
         job.current_epoch,
         job.total_epoch,
         job.attempt_count,
@@ -123,6 +136,7 @@ def _attempt_fingerprint(attempt: JobAttempt) -> tuple[object, ...]:
         attempt.engine_mode,
         attempt.rvc_commit_hash,
         attempt.execution_provenance_version,
+        attempt.job_config_sha256,
         attempt.runtime_image_digest,
         attempt.runtime_asset_manifest_sha256,
         attempt.status,
@@ -131,12 +145,21 @@ def _attempt_fingerprint(attempt: JobAttempt) -> tuple[object, ...]:
     )
 
 
-def _validated_job_config(job: Job) -> JobConfig:
+def _validated_job_config(job: Job, attempt: JobAttempt | None) -> JobConfig:
     if _contains_non_finite(job.config_json):
         raise _invalid()
     try:
-        config = JobConfig.model_validate(job.config_json)
-    except (TypeError, ValueError, ValidationError) as exc:
+        if job.config_sha256 is None:
+            if attempt is not None:
+                raise InvalidJobConfigLedger(
+                    "current attempt has no verifiable Job config snapshot"
+                )
+            # Pre-a7 Jobs without an attempt remain history-readable, but no
+            # execution evidence is projected from an unbound snapshot.
+            config = JobConfig.model_validate(job.config_json)
+        else:
+            config = validate_job_config_ledger(job, attempt=attempt)
+    except (TypeError, ValueError, ValidationError, InvalidJobConfigLedger) as exc:
         raise _invalid() from exc
     if (
         config.job_name != job.job_name
@@ -580,9 +603,16 @@ async def _assert_selection_is_current(
                 select(
                     Job.id,
                     Job.row_version,
+                    Job.job_name,
+                    Job.experiment_id,
+                    Job.dataset_id,
                     Job.status,
                     Job.worker_id,
                     Job.current_attempt_id,
+                    Job.config_json,
+                    Job.config_sha256,
+                    Job.test_set_id,
+                    Job.priority,
                     Job.current_epoch,
                     Job.total_epoch,
                     Job.attempt_count,
@@ -593,9 +623,16 @@ async def _assert_selection_is_current(
     current_jobs = {
         row.id: (
             row.row_version,
+            row.job_name,
+            row.experiment_id,
+            row.dataset_id,
             row.status,
             row.worker_id,
             row.current_attempt_id,
+            row.config_json,
+            row.config_sha256,
+            row.test_set_id,
+            row.priority,
             row.current_epoch,
             row.total_epoch,
             row.attempt_count,
@@ -620,6 +657,7 @@ async def _assert_selection_is_current(
                     JobAttempt.engine_mode,
                     JobAttempt.rvc_commit_hash,
                     JobAttempt.execution_provenance_version,
+                    JobAttempt.job_config_sha256,
                     JobAttempt.runtime_image_digest,
                     JobAttempt.runtime_asset_manifest_sha256,
                     JobAttempt.status,
@@ -637,6 +675,7 @@ async def _assert_selection_is_current(
             row.engine_mode,
             row.rvc_commit_hash,
             row.execution_provenance_version,
+            row.job_config_sha256,
             row.runtime_image_digest,
             row.runtime_asset_manifest_sha256,
             row.status,
@@ -659,8 +698,10 @@ async def build_experiment_comparison_jobs(
     # whole response if a final read shows that the selected current attempt
     # changed while it was being assembled.
     job_fingerprints = {job.id: _job_fingerprint(job) for job in jobs}
-    configs_by_job = {job.id: _validated_job_config(job) for job in jobs}
     attempts_by_job, attempt_reads = await _validated_current_attempts(session, jobs)
+    configs_by_job = {
+        job.id: _validated_job_config(job, attempts_by_job.get(job.id)) for job in jobs
+    }
     attempt_fingerprints = {
         attempt.id: _attempt_fingerprint(attempt) for attempt in attempts_by_job.values()
     }

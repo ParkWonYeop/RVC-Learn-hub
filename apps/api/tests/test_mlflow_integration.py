@@ -230,6 +230,9 @@ async def test_api_projects_creation_and_metric_batch_without_sensitive_paths(
         METRIC_BATCH,
     ]
     assert all(event.status == "synced" for event in events)
+    assert all(
+        event.payload_json["config_sha256"] == job.json()["config_sha256"] for event in events[1:]
+    )
     job_payload = events[1].payload_json
     serialized = json.dumps(job_payload, sort_keys=True)
     assert "g_path" not in serialized

@@ -34,6 +34,7 @@ from rvc_orchestrator_contracts import (
     WorkerHeartbeatRequest,
     WorkerRegisterRequest,
     WorkerStatus,
+    job_config_sha256,
 )
 
 from . import __version__
@@ -473,8 +474,7 @@ class WorkerAgent:
                 gpu_telemetry_available=initial_observation.gpu_telemetry_available,
             )
             active.next_system_telemetry_at = (
-                asyncio.get_running_loop().time()
-                + self.settings.system_telemetry_interval_seconds
+                asyncio.get_running_loop().time() + self.settings.system_telemetry_interval_seconds
             )
             base_runner = _base_runner(self.runner)
             if isinstance(base_runner, NativeTrainingTelemetryBinder):
@@ -526,6 +526,14 @@ class WorkerAgent:
             self.active_job = None
 
     async def _validate_claim_runtime(self, claim: JobClaim) -> None:
+        try:
+            current_config_sha256 = job_config_sha256(claim.config)
+        except (TypeError, ValueError) as exc:
+            raise RvcRuntimeIntegrityError(
+                "Job configuration changed after the Manager claim"
+            ) from exc
+        if current_config_sha256 != claim.config_sha256:
+            raise RvcRuntimeIntegrityError("Job configuration changed after the Manager claim")
         if claim.config.auto_inference_samples.enabled:
             sample_capabilities = await self._capabilities()
             if not sample_capabilities.fixed_test_set_inference_ready:

@@ -1566,6 +1566,7 @@ async def test_readiness_fails_closed_for_missing_or_stale_rq_worker(
         "redis": "ok",
         "rq_worker": "stale",
         "maintenance_reconciler": "ok",
+        "artifact_cleanup_reconciler": "stopped",
         "mlflow": "disabled",
     }
     app.state.rq_readiness = FakeProbe(("ok", True))

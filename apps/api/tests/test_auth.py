@@ -409,6 +409,26 @@ def test_production_requires_distinct_jwt_secret_or_readable_secret_file(tmp_pat
         )
 
 
+def test_production_api_requires_artifact_cleanup_reconciler() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="ARTIFACT_CLEANUP_RECONCILE_ENABLED",
+    ):
+        Settings(
+            environment="production",
+            database_url="postgresql+asyncpg://manager:test@db/manager",
+            worker_bootstrap_token="bootstrap",
+            worker_token_pepper="production-worker-token-pepper-long-value",
+            jwt_secret="production-jwt-secret-with-at-least-thirty-two-characters",
+            storage_backend="s3",
+            s3_endpoint_url="https://minio.example.test",
+            s3_presign_endpoint_url="https://objects.example.test",
+            s3_access_key_id="test-access-key",
+            s3_secret_access_key="test-secret-key",
+            artifact_cleanup_reconcile_enabled=False,
+        )
+
+
 @pytest.mark.parametrize(
     "endpoint",
     [

@@ -815,6 +815,7 @@ class JobRead(APIModel):
     job_name: str
     status: JobStatus
     config: JobConfig
+    config_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     test_set_id: str | None
     preset_id: str | None
     sample_plan_sha256: str | None

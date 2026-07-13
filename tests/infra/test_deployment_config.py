@@ -895,6 +895,15 @@ def test_manager_object_storage_is_remote_worker_reachable_and_spooled() -> None
         assert environment["S3_ENDPOINT_URL"] == "http://minio:9000"
         assert "S3_PRESIGN_ENDPOINT_URL" in environment
         assert environment["ARTIFACT_MAX_BYTES"] == "${ARTIFACT_MAX_BYTES:-5368709120}"
+        assert environment["ARTIFACT_UPLOAD_WRITE_HEARTBEAT_SECONDS"] == (
+            "${ARTIFACT_UPLOAD_WRITE_HEARTBEAT_SECONDS:-15}"
+        )
+        assert environment["ARTIFACT_STAGING_CLEANUP_GRACE_SECONDS"] == (
+            "${ARTIFACT_STAGING_CLEANUP_GRACE_SECONDS:-7200}"
+        )
+        assert environment["ARTIFACT_CLEANUP_RECONCILE_ENABLED"] == (
+            "${ARTIFACT_CLEANUP_RECONCILE_ENABLED:-true}"
+        )
         assert environment["ARTIFACT_ATTEMPT_MAX_SESSIONS"] == (
             "${ARTIFACT_ATTEMPT_MAX_SESSIONS:-256}"
         )
@@ -943,6 +952,15 @@ def test_example_environment_declares_artifact_transfer_limits() -> None:
         "S3_PRESIGN_ENDPOINT_URL=http://127.0.0.1:9000",
         "ARTIFACT_UPLOAD_TTL_SECONDS=3600",
         "ARTIFACT_MAX_BYTES=5368709120",
+        "ARTIFACT_UPLOAD_WRITE_HEARTBEAT_SECONDS=15",
+        "ARTIFACT_STAGING_CLEANUP_GRACE_SECONDS=7200",
+        "ARTIFACT_CLEANUP_CONFIRMATION_GRACE_SECONDS=60",
+        "ARTIFACT_CLEANUP_CLAIM_STALE_SECONDS=300",
+        "ARTIFACT_CLEANUP_HEARTBEAT_SECONDS=15",
+        "ARTIFACT_CLEANUP_RECONCILE_ENABLED=true",
+        "ARTIFACT_CLEANUP_RECONCILE_INTERVAL_SECONDS=30",
+        "ARTIFACT_CLEANUP_RECONCILE_STALE_SECONDS=120",
+        "ARTIFACT_CLEANUP_RECONCILE_BATCH_SIZE=32",
         "ARTIFACT_FINALIZING_STALE_SECONDS=7200",
         "ARTIFACT_ATTEMPT_MAX_SESSIONS=256",
         "ARTIFACT_ATTEMPT_MAX_BYTES=107374182400",

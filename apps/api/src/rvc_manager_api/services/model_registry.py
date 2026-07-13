@@ -16,7 +16,6 @@ from sqlalchemy.orm.exc import StaleDataError
 from rvc_orchestrator_contracts import (
     RVC_REVIEWED_COMMIT,
     ArtifactType,
-    JobConfig,
     JobStatus,
     utc_now,
 )
@@ -43,6 +42,7 @@ from ..schemas import (
     ModelRegistryRead,
 )
 from ..storage import StorageAdapter
+from .job_configs import InvalidJobConfigLedger, validated_job_config
 from .samples import (
     SampleCompletionUnavailable,
     SampleStorageUnavailable,
@@ -202,11 +202,7 @@ async def _lock_experiment_fence(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if (
-        actor is None
-        or actor.disabled
-        or actor.access_token_version != actor_token_version
-    ):
+    if actor is None or actor.disabled or actor.access_token_version != actor_token_version:
         raise ModelRegistryAuthenticationChanged("authentication state changed")
     assert experiment is not None
     _require_visible_experiment(experiment, actor)
@@ -229,13 +225,10 @@ async def _replay_or_none(
     )
     if operation is None:
         return None
-    if (
-        operation.operation_type != operation_type
-        or not hmac.compare_digest(operation.request_fingerprint, fingerprint)
+    if operation.operation_type != operation_type or not hmac.compare_digest(
+        operation.request_fingerprint, fingerprint
     ):
-        raise ModelRegistryConflict(
-            "idempotency key conflicts with a prior model registry request"
-        )
+        raise ModelRegistryConflict("idempotency key conflicts with a prior model registry request")
     return ModelRegistryMutationRead.model_validate(operation.response_json)
 
 
@@ -376,8 +369,10 @@ async def _candidate_context(
     job = await session.scalar(job_statement.execution_options(populate_existing=True))
     attempt = await session.scalar(attempt_statement.execution_options(populate_existing=True))
     try:
-        config = None if job is None else JobConfig.model_validate(job.config_json)
-    except ValueError as exc:
+        config = (
+            None if job is None or attempt is None else validated_job_config(job, attempt=attempt)
+        )
+    except InvalidJobConfigLedger as exc:
         raise ModelRegistryConflict("model registry Job configuration is invalid") from exc
     config_matches = bool(
         job is not None
@@ -387,8 +382,7 @@ async def _candidate_context(
         and config.dataset_id == job.dataset_id
         and config.training.epochs == job.total_epoch
         and config.resource.priority == job.priority
-        and (config.rvc_backend.rvc_commit_hash or RVC_REVIEWED_COMMIT)
-        == RVC_REVIEWED_COMMIT
+        and (config.rvc_backend.rvc_commit_hash or RVC_REVIEWED_COMMIT) == RVC_REVIEWED_COMMIT
     )
     current_matches = bool(
         not require_current
@@ -424,6 +418,7 @@ async def _candidate_context(
     ):
         raise ModelRegistryConflict("model registry candidate is not eligible")
     assert config is not None
+    assert job.config_sha256 is not None
 
     model_statement = select(Artifact.id).where(
         Artifact.job_id == job.id,
@@ -469,7 +464,7 @@ async def _candidate_context(
         attempt=attempt,
         model=model,
         index=index,
-        job_config_sha256=canonical_sha256(config.model_dump(mode="json")),
+        job_config_sha256=job.config_sha256,
     )
 
 
@@ -495,6 +490,7 @@ def _context_fingerprint(context: CandidateContext) -> str:
                 "provenance_version": context.attempt.execution_provenance_version,
                 "runtime_image": context.attempt.runtime_image_digest,
                 "runtime_assets": context.attempt.runtime_asset_manifest_sha256,
+                "job_config_sha256": context.attempt.job_config_sha256,
             },
             "artifacts": [
                 {
@@ -601,11 +597,9 @@ def _context_matches_entry(context: CandidateContext, entry: ModelRegistryEntry)
         and context.attempt.engine_mode == entry.engine_mode
         and context.job_config_sha256 == entry.job_config_sha256
         and context.attempt.rvc_commit_hash == entry.rvc_commit_hash
-        and context.attempt.execution_provenance_version
-        == entry.execution_provenance_version
+        and context.attempt.execution_provenance_version == entry.execution_provenance_version
         and context.attempt.runtime_image_digest == entry.runtime_image_digest
-        and context.attempt.runtime_asset_manifest_sha256
-        == entry.runtime_asset_manifest_sha256
+        and context.attempt.runtime_asset_manifest_sha256 == entry.runtime_asset_manifest_sha256
         and context.model.artifact.id == entry.model_artifact_id
         and context.model.artifact.filename == entry.model_filename
         and context.model.artifact.size_bytes == entry.model_size_bytes
@@ -628,11 +622,14 @@ async def get_registry(
     await _visible_experiment(session, experiment_id=experiment_id, actor=actor)
     registry = await session.get(ExperimentModelRegistry, experiment_id)
     if registry is None:
-        if await session.scalar(
-            select(ExperimentModelRegistry.row_version).where(
-                ExperimentModelRegistry.experiment_id == experiment_id
+        if (
+            await session.scalar(
+                select(ExperimentModelRegistry.row_version).where(
+                    ExperimentModelRegistry.experiment_id == experiment_id
+                )
             )
-        ) is not None:
+            is not None
+        ):
             raise ModelRegistryConflict("model registry changed while reading; retry")
         return ModelRegistryRead(
             experiment_id=experiment_id,
@@ -1002,10 +999,9 @@ async def promote_entry(
         require_current=False,
         lock=True,
     )
-    if (
-        not hmac.compare_digest(preflight_fingerprint, _context_fingerprint(context))
-        or not _context_matches_entry(context, entry)
-    ):
+    if not hmac.compare_digest(
+        preflight_fingerprint, _context_fingerprint(context)
+    ) or not _context_matches_entry(context, entry):
         raise ModelRegistryConflict("model registry frozen snapshot is inconsistent")
     previous = await _active_entry(session, experiment_id, lock=True)
     now = utc_now()

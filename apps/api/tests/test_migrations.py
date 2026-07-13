@@ -22,6 +22,7 @@ DATASET_PCM_QUALITY_REVISION = "f9c4a7d2b610"
 DATASET_PCM_LOUDNESS_REVISION = "d8f2a6c4b901"
 MODEL_REGISTRY_REVISION = "e4c7b9d2f610"
 MAINTENANCE_DB_AUTHZ_REVISION = "f5d1c8a9b240"
+JOB_CONFIG_INTEGRITY_REVISION = "a7c4e9f2b610"
 UNBOUND_STORAGE_NAMESPACE_SHA256 = "0" * 64
 
 
@@ -152,9 +153,7 @@ def test_model_registry_migration_preserves_historical_attempts_and_downgrades(
     command.downgrade(config, DATASET_PCM_LOUDNESS_REVISION)
     connection = sqlite3.connect(database_path)
     assert "rvc_commit_hash" not in table_columns(connection, "job_attempts")
-    assert "execution_provenance_version" not in table_columns(
-        connection, "job_attempts"
-    )
+    assert "execution_provenance_version" not in table_columns(connection, "job_attempts")
     remaining_tables = {
         str(row[0])
         for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -191,6 +190,227 @@ def table_sql(connection: sqlite3.Connection, table: str) -> str:
     ).fetchone()
     assert row is not None and row[0] is not None
     return str(row[0])
+
+
+def test_job_config_integrity_migration_preserves_historical_nulls_and_downgrades(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "job-config-integrity.db"
+    config = alembic_config(database_path, monkeypatch)
+    command.upgrade(config, MAINTENANCE_DB_AUTHZ_REVISION)
+    connection = sqlite3.connect(database_path)
+    timestamp = "2026-07-13 12:00:00+00:00"
+    worker_id = "10000000-0000-4000-8000-000000000001"
+    dataset_id = "10000000-0000-4000-8000-000000000002"
+    experiment_id = "10000000-0000-4000-8000-000000000003"
+    job_id = "10000000-0000-4000-8000-000000000004"
+    attempt_id = "10000000-0000-4000-8000-000000000005"
+    lease_id = "10000000-0000-4000-8000-000000000006"
+    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute(
+        """
+        INSERT INTO workers (
+            id, row_version, name, token_hash, token_issued_at, status,
+            capabilities_json, worker_version, rvc_commit_hash, is_active,
+            created_at, updated_at
+        ) VALUES (?, 1, 'historical-worker', ?, ?, 'idle', '{}', '0.1.0', ?, 1, ?, ?)
+        """,
+        (worker_id, "a" * 64, timestamp, "abcdef0", timestamp, timestamp),
+    )
+    connection.execute(
+        """
+        INSERT INTO datasets (
+            id, name, storage_uri, is_usable, status, decoder_pending_count,
+            retryable, created_at, updated_at
+        ) VALUES (?, 'historical-dataset', 'local:///historical', 1,
+                  'legacy_imported', 0, 0, ?, ?)
+        """,
+        (dataset_id, timestamp, timestamp),
+    )
+    connection.execute(
+        """
+        INSERT INTO experiments (
+            id, row_version, name, name_conflict_key, dataset_id,
+            created_by, created_at, updated_at
+        ) VALUES (?, 1, 'historical-experiment', NULL, ?, NULL, ?, ?)
+        """,
+        (experiment_id, dataset_id, timestamp, timestamp),
+    )
+    connection.execute(
+        """
+        INSERT INTO jobs (
+            id, row_version, experiment_id, dataset_id, worker_id, job_name,
+            status, config_json, priority, total_epoch, attempt_count,
+            current_attempt_id, created_at, updated_at
+        ) VALUES (?, 1, ?, ?, ?, 'historical-job', 'completed', '{}', 5, 1, 1, ?, ?, ?)
+        """,
+        (
+            job_id,
+            experiment_id,
+            dataset_id,
+            worker_id,
+            attempt_id,
+            timestamp,
+            timestamp,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO job_attempts (
+            id, job_id, worker_id, attempt_number, engine_mode,
+            execution_provenance_version, status, started_at, finished_at
+        ) VALUES (?, ?, ?, 1, 'rvc_webui', 'worker-claim-v1', 'completed', ?, ?)
+        """,
+        (attempt_id, job_id, worker_id, timestamp, timestamp),
+    )
+    connection.execute(
+        """
+        INSERT INTO job_leases (
+            id, job_id, attempt_id, worker_id, expires_at,
+            last_renewed_at, active
+        ) VALUES (?, ?, ?, ?, ?, ?, 0)
+        """,
+        (lease_id, job_id, attempt_id, worker_id, timestamp, timestamp),
+    )
+    connection.commit()
+    connection.close()
+
+    command.upgrade(config, JOB_CONFIG_INTEGRITY_REVISION)
+    connection = sqlite3.connect(database_path)
+    connection.execute("PRAGMA foreign_keys = ON")
+    assert "config_sha256" in table_columns(connection, "jobs")
+    assert "job_config_sha256" in table_columns(connection, "job_attempts")
+    assert "finalization_token" in table_columns(connection, "artifact_upload_sessions")
+    assert "upload_write_token" in table_columns(connection, "artifact_upload_sessions")
+    assert "upload_heartbeat_at" in table_columns(connection, "artifact_upload_sessions")
+    assert "cleanup_token" in table_columns(connection, "artifact_upload_sessions")
+    assert "cleanup_heartbeat_at" in table_columns(connection, "artifact_upload_sessions")
+    assert "staging_cleanup_first_deleted_at" in table_columns(
+        connection, "artifact_upload_sessions"
+    )
+    assert "staging_cleanup_completed_at" in table_columns(
+        connection, "artifact_upload_sessions"
+    )
+    assert "canonical_cleanup_completed_at" in table_columns(
+        connection, "artifact_upload_sessions"
+    )
+    assert "canonical_cleanup_first_deleted_at" in table_columns(
+        connection, "artifact_upload_sessions"
+    )
+    assert connection.execute(
+        "SELECT config_sha256 FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone() == (None,)
+    assert connection.execute(
+        "SELECT job_config_sha256 FROM job_attempts WHERE id = ?", (attempt_id,)
+    ).fetchone() == (None,)
+    assert connection.execute("SELECT id FROM job_leases WHERE id = ?", (lease_id,)).fetchone() == (
+        lease_id,
+    )
+    assert "ck_jobs_config_sha256_shape" in table_sql(connection, "jobs")
+    assert "ck_job_attempts_job_config_sha256_shape" in table_sql(connection, "job_attempts")
+    job_indexes = {
+        str(row[1]): bool(row[2]) for row in connection.execute("PRAGMA index_list('jobs')")
+    }
+    assert job_indexes["uq_job_id_config_sha256"] is True
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE jobs SET config_sha256 = ? WHERE id = ?",
+            ("A" * 64, job_id),
+        )
+    connection.rollback()
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE job_attempts SET job_config_sha256 = ? WHERE id = ?",
+            ("short", attempt_id),
+        )
+    connection.rollback()
+    matching_sha256 = "1" * 64
+    connection.execute(
+        "UPDATE jobs SET config_sha256 = ? WHERE id = ?",
+        (matching_sha256, job_id),
+    )
+    connection.commit()
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE job_attempts SET job_config_sha256 = ? WHERE id = ?",
+            ("2" * 64, attempt_id),
+        )
+    connection.rollback()
+    connection.execute(
+        "UPDATE job_attempts SET job_config_sha256 = ? WHERE id = ?",
+        (matching_sha256, attempt_id),
+    )
+    connection.commit()
+    connection.close()
+
+    command.downgrade(config, MAINTENANCE_DB_AUTHZ_REVISION)
+    connection = sqlite3.connect(database_path)
+    assert "config_sha256" not in table_columns(connection, "jobs")
+    assert "job_config_sha256" not in table_columns(connection, "job_attempts")
+    assert "finalization_token" not in table_columns(connection, "artifact_upload_sessions")
+    assert "upload_write_token" not in table_columns(connection, "artifact_upload_sessions")
+    assert "upload_heartbeat_at" not in table_columns(connection, "artifact_upload_sessions")
+    assert "cleanup_token" not in table_columns(connection, "artifact_upload_sessions")
+    assert "cleanup_heartbeat_at" not in table_columns(connection, "artifact_upload_sessions")
+    assert "staging_cleanup_first_deleted_at" not in table_columns(
+        connection, "artifact_upload_sessions"
+    )
+    assert "staging_cleanup_completed_at" not in table_columns(
+        connection, "artifact_upload_sessions"
+    )
+    assert "canonical_cleanup_completed_at" not in table_columns(
+        connection, "artifact_upload_sessions"
+    )
+    assert "canonical_cleanup_first_deleted_at" not in table_columns(
+        connection, "artifact_upload_sessions"
+    )
+    assert connection.execute("SELECT id FROM jobs WHERE id = ?", (job_id,)).fetchone() == (job_id,)
+    assert connection.execute(
+        "SELECT id FROM job_attempts WHERE id = ?", (attempt_id,)
+    ).fetchone() == (attempt_id,)
+    assert connection.execute("SELECT id FROM job_leases WHERE id = ?", (lease_id,)).fetchone() == (
+        lease_id,
+    )
+    connection.close()
+
+
+def test_job_config_integrity_migration_renders_postgresql_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    api_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://manager:unused@postgres/manager",
+    )
+    monkeypatch.setenv(
+        "JWT_SECRET",
+        "migration-test-jwt-secret-with-at-least-thirty-two-characters",
+    )
+    config = Config(str(api_root / "alembic.ini"))
+
+    command.upgrade(config, JOB_CONFIG_INTEGRITY_REVISION, sql=True)
+
+    rendered = capsys.readouterr().out
+    assert "ADD COLUMN config_sha256 VARCHAR(64)" in rendered
+    assert "ADD COLUMN job_config_sha256 VARCHAR(64)" in rendered
+    assert "ADD COLUMN finalization_token VARCHAR(36)" in rendered
+    assert "ADD COLUMN upload_write_token VARCHAR(36)" in rendered
+    assert "ADD COLUMN upload_heartbeat_at TIMESTAMP" in rendered
+    assert "ADD COLUMN cleanup_token VARCHAR(36)" in rendered
+    assert "ADD COLUMN cleanup_heartbeat_at TIMESTAMP" in rendered
+    assert "ADD COLUMN staging_cleanup_completed_at TIMESTAMP" in rendered
+    assert "ADD COLUMN staging_cleanup_first_deleted_at TIMESTAMP" in rendered
+    assert "ADD COLUMN canonical_cleanup_completed_at TIMESTAMP" in rendered
+    assert "ADD COLUMN canonical_cleanup_first_deleted_at TIMESTAMP" in rendered
+    assert "CREATE UNIQUE INDEX uq_job_id_config_sha256" in rendered
+    assert "ADD CONSTRAINT fk_job_attempt_job_config_snapshot" in rendered
+    assert "FOREIGN KEY(job_id, job_config_sha256)" in rendered
+    assert "REFERENCES jobs (id, config_sha256) ON DELETE CASCADE" in rendered
+    assert "UPDATE jobs" not in rendered
+    assert "UPDATE job_attempts" not in rendered
 
 
 def test_auth_migration_preserves_legacy_user_state_and_downgrades(

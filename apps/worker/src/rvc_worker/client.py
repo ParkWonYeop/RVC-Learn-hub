@@ -628,7 +628,17 @@ class HttpManagerClient:
                 request.content_type,
             )
 
-        await _await_with_cancellation(put(), cancellation)
+        ambiguous_put_error: ManagerClientError | None = None
+        try:
+            await _await_with_cancellation(put(), cancellation)
+        except ManagerClientError as exc:
+            # A transport failure can occur after the object store committed the
+            # body, while local replay returns 409 once sealed and S3 conditional
+            # replay returns 412. Manager finalize is the authority in all three
+            # cases because it re-reads and verifies the whole object.
+            if not (exc.retryable or exc.status_code in {409, 412}):
+                raise
+            ambiguous_put_error = exc
         finalize_path = (
             f"/api/v1/workers/jobs/{safe_job_id}/artifact-uploads/"
             f"{_path_id(initialized.upload_session_id)}/finalize"
@@ -664,6 +674,13 @@ class HttpManagerClient:
             )
             if refreshed.status == "completed" and refreshed.artifact is not None:
                 return refreshed.artifact
+            if ambiguous_put_error is not None:
+                raise ManagerClientError(
+                    "artifact upload acknowledgement is ambiguous",
+                    status_code=ambiguous_put_error.status_code,
+                    retryable=True,
+                    category="transport",
+                ) from ambiguous_put_error
             raise finalize_error
 
     async def register_sample(
@@ -1098,13 +1115,21 @@ def _validated_upload_headers(
             not lowered
             or lowered in normalized
             or (
-                lowered not in {"content-type", "content-length", "x-rvc-upload-token"}
+                lowered
+                not in {
+                    "content-type",
+                    "content-length",
+                    "if-none-match",
+                    "x-rvc-upload-token",
+                }
                 and not lowered.startswith("x-amz-")
             )
             or any(character in name + value for character in "\r\n\x00")
         ):
             raise ManagerClientError("Manager returned unsafe artifact upload headers")
         normalized[lowered] = value.strip()
+    if "if-none-match" in normalized and normalized["if-none-match"] != "*":
+        raise ManagerClientError("Manager returned unsafe artifact upload headers")
     if normalized.get("content-length") != str(expected_size):
         raise ManagerClientError("artifact upload Content-Length does not match the source")
     if normalized.get("content-type", "").lower() != expected_content_type:

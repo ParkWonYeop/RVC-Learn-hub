@@ -12,6 +12,7 @@ from rvc_orchestrator_contracts import (
     JobClaim,
     JobConfig,
     WorkerCapabilities,
+    job_config_sha256,
     utc_now,
 )
 from rvc_orchestrator_contracts import (
@@ -95,6 +96,7 @@ def _claim(config: JobConfig, transfer: TransferDescriptor | None) -> JobClaim:
         lease_id="lease-1",
         lease_expires_at=utc_now() + timedelta(minutes=5),
         config=config,
+        config_sha256=job_config_sha256(config),
         test_set_transfer=transfer,
     )
 
@@ -119,6 +121,15 @@ def test_test_set_transfer_is_storage_neutral_and_ordered() -> None:
         item["download_path"] = unsafe
         with pytest.raises(ValidationError):
             TransferItemDescriptor.model_validate(item)
+
+
+def test_job_claim_rejects_a_config_snapshot_hash_mismatch() -> None:
+    config = _config(samples=False)
+    payload = _claim(config, None).model_dump(mode="json")
+    payload["config"]["training"]["epochs"] += 1
+
+    with pytest.raises(ValidationError, match="config hash does not match"):
+        JobClaim.model_validate(payload)
 
 
 @pytest.mark.parametrize(

@@ -21,7 +21,6 @@ from rvc_orchestrator_contracts import (
     InvalidJobTransition,
     JobClaim,
     JobClaimRequest,
-    JobConfig,
     JobStatus,
     JobStatusUpdate,
     LeaseRenewRequest,
@@ -74,6 +73,7 @@ from ..schemas import (
 from ..security import hash_worker_token, issue_worker_token, verify_bootstrap_token
 from ..services.artifacts import attachment_content_disposition
 from ..services.datasets import dataset_ready_for_training
+from ..services.job_configs import InvalidJobConfigLedger, validated_job_config
 from ..services.job_observability import redact_log_fields, redact_log_text
 from ..services.mlflow import artifact_event_key, metric_event_key
 from ..services.samples import SampleCompletionUnavailable, sample_completion_ready
@@ -807,6 +807,14 @@ async def heartbeat(
             .with_for_update()
             .execution_options(populate_existing=True)
         )
+        if job is not None and attempt is not None:
+            try:
+                validated_job_config(job, attempt=attempt)
+            except InvalidJobConfigLedger as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="job configuration integrity check failed",
+                ) from exc
         if (
             lease is None
             or job is None
@@ -1132,7 +1140,16 @@ async def download_job_test_set_item(
     ):
         raise HTTPException(status_code=503, detail="test set storage namespace is unavailable")
 
-    config = JobConfig.model_validate(job.config_json)
+    attempt = await session.get(JobAttempt, attempt_id)
+    if attempt is None:
+        raise HTTPException(status_code=409, detail="job attempt is no longer current")
+    try:
+        config = validated_job_config(job, attempt=attempt)
+    except InvalidJobConfigLedger as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="job configuration integrity check failed",
+        ) from exc
     transfer = await verified_test_set_transfer(
         session,
         job,
@@ -1206,7 +1223,15 @@ async def _required_artifacts_exist(
     job: Job,
     settings: SettingsDep,
 ) -> bool:
-    config = JobConfig.model_validate(job.config_json)
+    attempt = (
+        await session.get(JobAttempt, job.current_attempt_id) if job.current_attempt_id else None
+    )
+    if attempt is None:
+        return False
+    try:
+        config = validated_job_config(job, attempt=attempt)
+    except InvalidJobConfigLedger:
+        return False
     required = set()
     if config.artifacts.collect_small_model:
         required.add(ArtifactType.FINAL_SMALL_MODEL.value)
@@ -1218,12 +1243,8 @@ async def _required_artifacts_exist(
         required.add(ArtifactType.FINAL_INDEX.value)
     if not required:
         return True
-    attempt = (
-        await session.get(JobAttempt, job.current_attempt_id) if job.current_attempt_id else None
-    )
     allow_legacy_fake = (
-        attempt is not None
-        and attempt.engine_mode == "fake"
+        attempt.engine_mode == "fake"
         and settings.allow_fake_workers
         and settings.environment != "production"
     )
@@ -1278,6 +1299,14 @@ async def _lock_current_status_claim(
     )
     now = utc_now()
     terminal_values = {item.value for item in TERMINAL_JOB_STATUSES}
+    if job is not None and attempt is not None:
+        try:
+            validated_job_config(job, attempt=attempt)
+        except InvalidJobConfigLedger as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="job configuration integrity check failed",
+            ) from exc
     if (
         lease is None
         or job is None
@@ -1711,6 +1740,13 @@ async def _lock_telemetry_claim(
     assert job is not None
     assert attempt is not None
     assert locked_worker is not None
+    try:
+        validated_job_config(job, attempt=attempt)
+    except InvalidJobConfigLedger as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="job configuration integrity check failed",
+        ) from exc
 
     active_claim = lease.active and lease.released_at is None
     if active_claim:
@@ -1872,11 +1908,12 @@ async def ingest_logs(
     worker: WorkerDep,
     session: SessionDep,
 ) -> OperationAck:
+    actor_worker_id = worker.id
     fingerprint = _log_batch_fingerprint(payload)
     sequences = [entry.sequence for entry in payload.entries]
     lease, _, _, late = await _lock_telemetry_claim(
         session,
-        worker_id=worker.id,
+        worker_id=actor_worker_id,
         job_id=job_id,
         lease_id=payload.lease_id,
         attempt_id=payload.attempt_id,
@@ -1912,7 +1949,7 @@ async def ingest_logs(
     if not late:
         lease, _, _ = await _acquire_active_telemetry_write_fence(
             session,
-            worker_id=worker.id,
+            worker_id=actor_worker_id,
             job_id=job_id,
             lease_id=payload.lease_id,
             attempt_id=payload.attempt_id,
@@ -1958,6 +1995,21 @@ async def ingest_logs(
         )
         if raced is not None:
             _validate_batch_replay(raced, fingerprint)
+            await _lock_telemetry_claim(
+                session,
+                worker_id=actor_worker_id,
+                job_id=job_id,
+                lease_id=payload.lease_id,
+                attempt_id=payload.attempt_id,
+                batch_type="logs",
+                sequences=sequences,
+            )
+            # The replay check above deliberately reacquires the current
+            # lease/job/attempt/worker locks after the failed commit.  A
+            # duplicate response must not keep those locks until dependency
+            # teardown, however, and metrics must never call MLflow while
+            # holding them.
+            await session.rollback()
             return OperationAck(duplicate=True)
         raise HTTPException(status_code=409, detail="telemetry ingest conflicted") from exc
     return OperationAck(accepted=len(new_entries))
@@ -1971,11 +2023,12 @@ async def ingest_metrics(
     session: SessionDep,
     mlflow: MlflowDep,
 ) -> OperationAck:
+    actor_worker_id = worker.id
     fingerprint = _metric_batch_fingerprint(payload)
     sequences = [entry.sequence for entry in payload.entries]
     lease, job, attempt, late = await _lock_telemetry_claim(
         session,
-        worker_id=worker.id,
+        worker_id=actor_worker_id,
         job_id=job_id,
         lease_id=payload.lease_id,
         attempt_id=payload.attempt_id,
@@ -2020,7 +2073,7 @@ async def ingest_metrics(
     if not late:
         lease, job, attempt = await _acquire_active_telemetry_write_fence(
             session,
-            worker_id=worker.id,
+            worker_id=actor_worker_id,
             job_id=job_id,
             lease_id=payload.lease_id,
             attempt_id=payload.attempt_id,
@@ -2085,6 +2138,16 @@ async def ingest_metrics(
         )
         if raced is not None:
             _validate_batch_replay(raced, fingerprint)
+            await _lock_telemetry_claim(
+                session,
+                worker_id=actor_worker_id,
+                job_id=job_id,
+                lease_id=payload.lease_id,
+                attempt_id=payload.attempt_id,
+                batch_type="metrics",
+                sequences=sequences,
+            )
+            await session.rollback()
             await mlflow.sync_after_commit(
                 metric_event_key(payload.attempt_id, payload.idempotency_key)
             )

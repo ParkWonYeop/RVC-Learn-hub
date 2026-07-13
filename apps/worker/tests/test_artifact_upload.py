@@ -49,6 +49,7 @@ class ArtifactPutTests(unittest.IsolatedAsyncioTestCase):
             headers = {
                 "Content-Type": "application/x-pytorch",
                 "Content-Length": str(source.stat().st_size),
+                "If-None-Match": "*",
                 "x-amz-meta-sha256": "a" * 64,
             }
 
@@ -65,6 +66,7 @@ class ArtifactPutTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(captured["body"], b"model-payload")
             self.assertEqual(observed_headers["content-length"], str(len(b"model-payload")))
             self.assertEqual(observed_headers["content-type"], "application/x-pytorch")
+            self.assertEqual(observed_headers["if-none-match"], "*")
             self.assertNotIn("authorization", observed_headers)
 
     async def test_artifact_manager_and_object_requests_use_distinct_factories(
@@ -165,6 +167,14 @@ class ArtifactPutTests(unittest.IsolatedAsyncioTestCase):
                 await client._put_file(  # noqa: SLF001
                     "https://objects.example/upload",
                     {**valid, "Authorization": "Bearer must-not-forward"},
+                    source,
+                    5,
+                    "application/octet-stream",
+                )
+            with self.assertRaisesRegex(ManagerClientError, "unsafe artifact upload headers"):
+                await client._put_file(  # noqa: SLF001
+                    "https://objects.example/upload",
+                    {**valid, "If-None-Match": '"untrusted-etag"'},
                     source,
                     5,
                     "application/octet-stream",
@@ -373,14 +383,82 @@ class ArtifactPublishSequenceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(task, timeout=1)
             self.assertTrue(client.put_cancelled)
 
+    async def test_ambiguous_put_acknowledgement_proceeds_to_manager_finalize(self) -> None:
+        with TemporaryDirectory() as temporary:
+            source = Path(temporary) / "model.pth"
+            source.write_bytes(b"model")
+            claim = make_claim(build_index=False)
+            request = _candidate_request(claim, source)
+            pending = ArtifactUploadInitResponse(
+                upload_session_id="upload-ambiguous",
+                status="pending",
+                method="PUT",
+                upload_url="https://objects.example/upload",
+                upload_headers={
+                    "Content-Type": request.content_type,
+                    "Content-Length": str(request.size_bytes),
+                    "If-None-Match": "*",
+                },
+                expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            )
+            artifact = _published_artifact(claim, request)
+            for put_error in (
+                ManagerClientError(
+                    "response lost",
+                    retryable=True,
+                    category="transport",
+                ),
+                ManagerClientError("already sealed", status_code=409),
+                ManagerClientError("precondition failed", status_code=412),
+            ):
+                client = _ScriptedClient([pending, artifact], put_error=put_error)
+                result = await client.publish_artifact(claim.job_id, request, source)
+                self.assertEqual(result.id, artifact.id)
+                self.assertEqual([call[0] for call in client.calls], ["POST", "POST"])
+
+    async def test_ambiguous_put_without_object_remains_bounded_retryable(self) -> None:
+        with TemporaryDirectory() as temporary:
+            source = Path(temporary) / "model.pth"
+            source.write_bytes(b"model")
+            claim = make_claim(build_index=False)
+            request = _candidate_request(claim, source)
+            pending = ArtifactUploadInitResponse(
+                upload_session_id="upload-missing",
+                status="pending",
+                method="PUT",
+                upload_url="https://objects.example/upload",
+                upload_headers={
+                    "Content-Type": request.content_type,
+                    "Content-Length": str(request.size_bytes),
+                },
+                expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            )
+            client = _ScriptedClient(
+                [
+                    pending,
+                    ManagerClientError("object not found", status_code=409),
+                    pending,
+                ],
+                put_error=ManagerClientError(
+                    "response lost",
+                    retryable=True,
+                    category="transport",
+                ),
+            )
+            with self.assertRaises(ManagerClientError) as raised:
+                await client.publish_artifact(claim.job_id, request, source)
+            self.assertTrue(raised.exception.retryable)
+            self.assertIn("acknowledgement is ambiguous", str(raised.exception))
+
 
 class _ScriptedClient(HttpManagerClient):
-    def __init__(self, responses, *, block_put: bool = False) -> None:
+    def __init__(self, responses, *, block_put: bool = False, put_error=None) -> None:
         super().__init__("https://manager.example", "bootstrap", worker_token="worker")
         self.responses = list(responses)
         self.calls = []
         self.puts = []
         self.block_put = block_put
+        self.put_error = put_error
         self.put_started = asyncio.Event()
         self.put_cancelled = False
 
@@ -395,7 +473,10 @@ class _ScriptedClient(HttpManagerClient):
         cancellation,
     ):
         self.calls.append((method, path, body, response_model, timeout_seconds, cancellation))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
     async def _put_file(self, upload_url, headers, source, expected_size, expected_content_type):
         del upload_url, headers, expected_size, expected_content_type
@@ -403,6 +484,8 @@ class _ScriptedClient(HttpManagerClient):
         try:
             if self.block_put:
                 await asyncio.Event().wait()
+            if self.put_error is not None:
+                raise self.put_error
             self.puts.append((source, source.read_bytes()))
         except asyncio.CancelledError:
             self.put_cancelled = True

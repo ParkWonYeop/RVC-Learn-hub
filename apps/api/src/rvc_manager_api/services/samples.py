@@ -10,7 +10,8 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rvc_orchestrator_contracts import (
@@ -20,6 +21,7 @@ from rvc_orchestrator_contracts import (
     SAMPLE_PCM_CLIPPING_THRESHOLD,
     SAMPLE_PCM_METRICS_ALGORITHM,
     SAMPLE_PCM_SILENCE_THRESHOLD,
+    TERMINAL_JOB_STATUSES,
     ArtifactType,
     InferenceF0Method,
     JobConfig,
@@ -27,6 +29,7 @@ from rvc_orchestrator_contracts import (
     SampleMetricValues,
     SampleRead,
     SampleRegistrationRequest,
+    job_config_sha256,
 )
 
 from ..config import Settings
@@ -45,6 +48,7 @@ from .artifacts import (
     remove_spool_file,
     verify_object_to_spool,
 )
+from .job_configs import InvalidJobConfigLedger, validated_job_config
 from .workers import verified_test_set_transfer
 
 _METRIC_ABSOLUTE_TOLERANCE = 1e-6
@@ -65,6 +69,14 @@ class SampleCompletionUnavailable(RuntimeError):
     """Current canonical bytes could not be reverified for a retryable reason."""
 
 
+class SampleRegistrationFenceConflict(RuntimeError):
+    """The Job/attempt snapshot changed before a Sample ledger write."""
+
+
+class SampleRegistrationFenceUnavailable(RuntimeError):
+    """The final Sample registration write fence could not be acquired."""
+
+
 @dataclass(frozen=True, slots=True)
 class SamplePcmInspection:
     sample_rate_hz: int
@@ -77,6 +89,98 @@ class SamplePcmInspection:
 class VerifiedArtifactBinding:
     artifact: Artifact
     upload: ArtifactUploadSession
+
+
+async def acquire_sample_registration_job_fence(
+    session: AsyncSession,
+    *,
+    job_id: str,
+    attempt_id: str,
+    worker_id: str,
+    test_set_id: str,
+    sample_plan_sha256: str,
+    expected_config: JobConfig,
+    runtime_image_digest: str,
+    runtime_asset_manifest_sha256: str,
+) -> tuple[Job, JobAttempt]:
+    """Serialize the final Sample write and revalidate its immutable snapshot.
+
+    ``SELECT ... FOR UPDATE`` is intentionally not the only fence here because
+    SQLite ignores it.  The no-op UPDATE acquires a real database write lock on
+    SQLite and a Job row lock on PostgreSQL.  Its predicates are also a CAS for
+    the claim fields that are safe to compare in SQL.  The raw and normalized
+    JobConfig hashes are checked again after the write fence is held so a
+    same-hash JSON mutation cannot reach the Sample ledger.
+    """
+
+    expected_config_sha256 = job_config_sha256(expected_config)
+    terminal_values = [item.value for item in TERMINAL_JOB_STATUSES]
+    try:
+        fenced = await session.execute(
+            update(Job)
+            .where(
+                Job.id == job_id,
+                Job.worker_id == worker_id,
+                Job.current_attempt_id == attempt_id,
+                Job.test_set_id == test_set_id,
+                Job.sample_plan_sha256 == sample_plan_sha256,
+                Job.config_sha256 == expected_config_sha256,
+                Job.cancel_requested_at.is_(None),
+                Job.status.not_in(terminal_values),
+            )
+            .values(row_version=Job.row_version, updated_at=Job.updated_at)
+            .execution_options(synchronize_session=False)
+        )
+    except OperationalError as exc:
+        # A failed SQLite write leaves the transaction unusable.  Callers must
+        # retry the complete verification/registration flow rather than reuse
+        # locks or identity-map state from before this rollback.
+        await session.rollback()
+        raise SampleRegistrationFenceUnavailable(
+            "sample registration write fence is temporarily unavailable"
+        ) from exc
+    if fenced.rowcount != 1:  # type: ignore[attr-defined]
+        raise SampleRegistrationFenceConflict("sample Job claim changed before registration")
+
+    job = await session.scalar(
+        select(Job)
+        .where(Job.id == job_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    attempt = await session.scalar(
+        select(JobAttempt)
+        .where(JobAttempt.id == attempt_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if job is None or attempt is None:
+        raise SampleRegistrationFenceConflict("sample Job claim changed before registration")
+    try:
+        locked_config = validated_job_config(job, attempt=attempt)
+    except InvalidJobConfigLedger as exc:
+        raise SampleRegistrationFenceConflict(
+            "sample JobConfig snapshot changed before registration"
+        ) from exc
+    if (
+        job.worker_id != worker_id
+        or job.current_attempt_id != attempt_id
+        or job.test_set_id != test_set_id
+        or job.sample_plan_sha256 != sample_plan_sha256
+        or job.cancel_requested_at is not None
+        or job.status in terminal_values
+        or job.config_sha256 != expected_config_sha256
+        or attempt.job_id != job_id
+        or attempt.worker_id != worker_id
+        or attempt.job_config_sha256 != expected_config_sha256
+        or attempt.finished_at is not None
+        or attempt.status in terminal_values
+        or attempt.runtime_image_digest != runtime_image_digest
+        or attempt.runtime_asset_manifest_sha256 != runtime_asset_manifest_sha256
+        or locked_config != expected_config
+    ):
+        raise SampleRegistrationFenceConflict("sample Job claim changed before registration")
+    return job, attempt
 
 
 def _verified_binding_from_rows(
@@ -546,13 +650,17 @@ async def sample_completion_ready(
 ) -> bool:
     if job.current_attempt_id is None:
         return False
-    config = JobConfig.model_validate(job.config_json)
+    attempt = await session.get(JobAttempt, job.current_attempt_id)
+    if attempt is None:
+        return False
+    try:
+        config = validated_job_config(job, attempt=attempt)
+    except InvalidJobConfigLedger:
+        return False
     if not config.auto_inference_samples.enabled:
         return True
-    attempt = await session.get(JobAttempt, job.current_attempt_id)
     if (
-        attempt is None
-        or attempt.job_id != job.id
+        attempt.job_id != job.id
         or attempt.worker_id != worker_id
         or attempt.runtime_image_digest is None
         or attempt.runtime_asset_manifest_sha256 is None

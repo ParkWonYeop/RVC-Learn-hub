@@ -15,7 +15,8 @@ import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient
 from pydantic import ValidationError
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import OperationalError
 from starlette.concurrency import run_in_threadpool
 
 import rvc_manager_api.routers.artifacts as artifact_routes
@@ -1246,6 +1247,101 @@ async def test_sample_registration_rejects_mismatched_provenance_pcm_and_namespa
             or 0
         )
         assert sample_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sample_registration_job_fence_takes_a_real_sqlite_write_lock(
+    app: FastAPI,
+    client: AsyncClient,
+) -> None:
+    context = await _sample_job(app, client, suffix="sqlite-job-write-fence")
+
+    async with app.state.database.session_factory() as fenced_session:
+        job = await fenced_session.get(Job, context.job_id)
+        attempt = await fenced_session.get(JobAttempt, context.claim["attempt_id"])
+        assert job is not None
+        assert attempt is not None
+        assert job.test_set_id is not None
+        assert job.sample_plan_sha256 is not None
+        assert attempt.runtime_image_digest is not None
+        assert attempt.runtime_asset_manifest_sha256 is not None
+        config = sample_services.validated_job_config(job, attempt=attempt)
+        initial_row_version = job.row_version
+
+        fenced_job, fenced_attempt = await sample_services.acquire_sample_registration_job_fence(
+            fenced_session,
+            job_id=job.id,
+            attempt_id=attempt.id,
+            worker_id=attempt.worker_id,
+            test_set_id=job.test_set_id,
+            sample_plan_sha256=job.sample_plan_sha256,
+            expected_config=config,
+            runtime_image_digest=attempt.runtime_image_digest,
+            runtime_asset_manifest_sha256=attempt.runtime_asset_manifest_sha256,
+        )
+        assert fenced_job.row_version == initial_row_version
+        assert fenced_attempt.id == attempt.id
+
+        # SELECT ... FOR UPDATE is ignored by SQLite.  A second writer can only
+        # be rejected here because the service performed the no-op Job UPDATE.
+        async with app.state.database.session_factory() as competing_session:
+            await competing_session.execute(text("PRAGMA busy_timeout = 0"))
+            with pytest.raises(OperationalError, match="database is locked"):
+                await competing_session.execute(
+                    update(Job)
+                    .where(Job.id == context.job_id)
+                    .values(current_epoch=Job.current_epoch)
+                )
+            await competing_session.rollback()
+        await fenced_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_sample_registration_job_fence_revalidates_raw_config_after_update(
+    app: FastAPI,
+    client: AsyncClient,
+) -> None:
+    context = await _sample_job(app, client, suffix="job-config-revalidation")
+
+    async with app.state.database.session_factory() as session:
+        job = await session.get(Job, context.job_id)
+        attempt = await session.get(JobAttempt, context.claim["attempt_id"])
+        assert job is not None
+        assert attempt is not None
+        assert job.test_set_id is not None
+        assert job.sample_plan_sha256 is not None
+        assert attempt.runtime_image_digest is not None
+        assert attempt.runtime_asset_manifest_sha256 is not None
+        expected_config = sample_services.validated_job_config(job, attempt=attempt)
+        test_set_id = job.test_set_id
+        sample_plan_sha256 = job.sample_plan_sha256
+        worker_id = attempt.worker_id
+        runtime_image_digest = attempt.runtime_image_digest
+        runtime_asset_manifest_sha256 = attempt.runtime_asset_manifest_sha256
+        tampered_config = dict(job.config_json)
+        tampered_config["job_name"] = "same-hash-raw-json-tamper"
+        await session.execute(
+            update(Job).where(Job.id == context.job_id).values(config_json=tampered_config)
+        )
+        await session.commit()
+
+    async with app.state.database.session_factory() as session:
+        with pytest.raises(
+            sample_services.SampleRegistrationFenceConflict,
+            match="JobConfig snapshot changed",
+        ):
+            await sample_services.acquire_sample_registration_job_fence(
+                session,
+                job_id=context.job_id,
+                attempt_id=context.claim["attempt_id"],
+                worker_id=worker_id,
+                test_set_id=test_set_id,
+                sample_plan_sha256=sample_plan_sha256,
+                expected_config=expected_config,
+                runtime_image_digest=runtime_image_digest,
+                runtime_asset_manifest_sha256=runtime_asset_manifest_sha256,
+            )
+        await session.rollback()
 
 
 @pytest.mark.asyncio

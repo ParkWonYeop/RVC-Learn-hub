@@ -82,6 +82,25 @@ async def readiness(request: Request) -> ReadinessResponse | JSONResponse:
     else:
         checks["maintenance_reconciler"] = "disabled"
 
+    if settings.artifact_cleanup_reconcile_enabled:
+        artifact_cleanup_reconciler = request.app.state.artifact_cleanup_reconciler
+        if artifact_cleanup_reconciler is None:
+            checks["artifact_cleanup_reconciler"] = "not_configured"
+            if settings.environment == "production":
+                ready = False
+        else:
+            cleanup_status, cleanup_ready = artifact_cleanup_reconciler.readiness()
+            checks["artifact_cleanup_reconciler"] = cleanup_status
+            # Test clients may intentionally bypass ASGI lifespan. Production
+            # always gates on this reconciler; non-production gates once its
+            # background task has actually started.
+            if settings.environment == "production" or artifact_cleanup_reconciler.running:
+                ready = ready and cleanup_ready
+    else:
+        checks["artifact_cleanup_reconciler"] = "disabled"
+        if settings.environment == "production":
+            ready = False
+
     mlflow_status, mlflow_ready = await request.app.state.mlflow.readiness()
     checks["mlflow"] = mlflow_status
     ready = ready and mlflow_ready

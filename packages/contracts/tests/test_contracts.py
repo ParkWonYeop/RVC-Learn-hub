@@ -21,7 +21,9 @@ from rvc_orchestrator_contracts import (
     WorkerTokenRotationPrepareResponse,
     WorkerTokenRotationStatus,
     can_transition_job,
+    canonical_job_config_bytes,
     feature_directory_for_version,
+    job_config_sha256,
     validate_job_transition,
 )
 
@@ -117,6 +119,39 @@ def make_config(**overrides: object) -> JobConfig:
 def test_version_controls_feature_directory() -> None:
     assert feature_directory_for_version(RVCVersion.V1) == "3_feature256"
     assert make_config().feature_directory == "3_feature768"
+
+
+def test_job_config_hash_is_canonical_and_includes_normalized_defaults() -> None:
+    config = make_config()
+    normalized = config.model_dump(mode="json")
+    reversed_keys = dict(reversed(tuple(normalized.items())))
+
+    assert job_config_sha256(normalized) == job_config_sha256(reversed_keys)
+    assert job_config_sha256(config) == job_config_sha256(normalized)
+    assert job_config_sha256(config) == (
+        "756dea9f7db3ed8f23b705f65d4711a4de1f9c39c16d991e4c7f32ad9ec3d175"
+    )
+    assert job_config_sha256(
+        {
+            "job_name": config.job_name,
+            "experiment_id": config.experiment_id,
+            "dataset_id": config.dataset_id,
+            "model": config.model.model_dump(mode="json"),
+        }
+    ) != job_config_sha256(config)
+
+
+def test_job_config_rejects_non_finite_minimum_vram() -> None:
+    with pytest.raises(ValidationError, match="minimum VRAM must be finite"):
+        make_config(resource={"min_vram_gb": float("inf")})
+
+
+def test_job_config_hash_normalizes_signed_zero_for_jsonb_round_trips() -> None:
+    negative_zero = make_config(resource={"min_vram_gb": -0.0})
+    positive_zero = make_config(resource={"min_vram_gb": 0.0})
+
+    assert job_config_sha256(negative_zero) == job_config_sha256(positive_zero)
+    assert b"-0.0" not in canonical_job_config_bytes(negative_zero)
 
 
 def test_training_and_inference_f0_enums_are_distinct() -> None:

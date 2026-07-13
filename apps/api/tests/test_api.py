@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import timedelta
 
+import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient
 from pydantic import ValidationError
@@ -22,9 +23,15 @@ from rvc_manager_api.models import (
     JobStatusEvent,
     Metric,
     Worker,
+    new_id,
 )
 from rvc_manager_api.services.workers import worker_can_run
-from rvc_orchestrator_contracts import JobConfig, WorkerCapabilities, utc_now
+from rvc_orchestrator_contracts import (
+    JobConfig,
+    WorkerCapabilities,
+    job_config_sha256,
+    utc_now,
+)
 
 
 def capabilities(
@@ -121,8 +128,10 @@ async def create_job(
         json=job_payload,
     )
     assert job_response.status_code == 201, job_response.text
-    assert job_response.json()["current_attempt_engine_mode"] is None
-    return dataset_id, experiment_id, job_response.json()["id"]
+    job_body = job_response.json()
+    assert job_body["current_attempt_engine_mode"] is None
+    assert job_body["config_sha256"] == job_config_sha256(job_body["config"])
+    return dataset_id, experiment_id, job_body["id"]
 
 
 async def claim(client: AsyncClient, token: str):
@@ -282,13 +291,108 @@ async def test_atomic_claim_creates_single_attempt_and_lease(
     assert body["job_id"] == job_id
     assert body["attempt_number"] == 1
     assert body["config"]["model"]["version"] == "v2"
+    assert body["config_sha256"] == job_config_sha256(body["config"])
 
     async with app.state.database.session_factory() as session:
+        job = await session.get(Job, job_id)
         attempts = list((await session.scalars(select(JobAttempt))).all())
         leases = list((await session.scalars(select(JobLease))).all())
+        assert job is not None
+        assert job.config_sha256 == body["config_sha256"]
         assert len(attempts) == 1
+        assert attempts[0].job_config_sha256 == body["config_sha256"]
         assert len(leases) == 1
         assert leases[0].active is True
+
+
+@pytest.mark.parametrize("tamper", ["json", "hash", "missing_hash"])
+async def test_claim_and_job_read_fail_closed_for_a_tampered_config_snapshot(
+    tamper: str,
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    worker_id, token = await register_worker(client, "gpu-config-integrity")
+    _, _, job_id = await create_job(client, admin_headers)
+    async with app.state.database.session_factory() as session:
+        job = await session.get(Job, job_id)
+        assert job is not None and job.config_sha256 is not None
+        if tamper == "json":
+            document = dict(job.config_json)
+            training = dict(document["training"])
+            training["batch_size_per_gpu"] = training["batch_size_per_gpu"] + 1
+            document["training"] = training
+            job.config_json = document
+        elif tamper == "hash":
+            job.config_sha256 = "0" * 64
+        else:
+            job.config_sha256 = None
+        await session.commit()
+
+    response = await claim(client, token)
+    assert response.status_code == 204
+    read = await client.get(f"/api/v1/jobs/{job_id}", headers=admin_headers)
+    if tamper == "missing_hash":
+        assert read.status_code == 200
+        assert read.json()["config_sha256"] is None
+    else:
+        assert read.status_code == 409
+        assert read.json()["detail"] == "job configuration integrity check failed"
+
+    async with app.state.database.session_factory() as session:
+        job = await session.get(Job, job_id)
+        worker = await session.get(Worker, worker_id)
+        attempts = list(
+            (await session.scalars(select(JobAttempt).where(JobAttempt.job_id == job_id))).all()
+        )
+        assert job is not None
+        assert job.status == ("queued" if tamper == "missing_hash" else "failed")
+        assert job.error_code == (
+            None if tamper == "missing_hash" else "job_config_integrity_failed"
+        )
+        assert job.current_attempt_id is None
+        assert worker is not None and worker.status == "idle"
+        assert worker.current_job_id is None
+        assert attempts == []
+
+
+async def test_historical_null_jobs_do_not_starve_a_new_claim(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    _, token = await register_worker(client, "gpu-historical-null-queue")
+    _, _, job_id = await create_job(client, admin_headers)
+    async with app.state.database.session_factory() as session:
+        current = await session.get(Job, job_id)
+        assert current is not None
+        session.add_all(
+            [
+                Job(
+                    id=new_id(),
+                    experiment_id=current.experiment_id,
+                    dataset_id=current.dataset_id,
+                    job_name=f"historical-null-{index}",
+                    status="queued",
+                    config_json=current.config_json,
+                    config_sha256=None,
+                    priority=current.priority + 1,
+                    total_epoch=current.total_epoch,
+                )
+                for index in range(50)
+            ]
+        )
+        await session.commit()
+
+    assignment = await claim(client, token)
+    assert assignment.status_code == 200, assignment.text
+    assert assignment.json()["job_id"] == job_id
+    async with app.state.database.session_factory() as session:
+        historical = list(
+            (await session.scalars(select(Job).where(Job.config_sha256.is_(None)))).all()
+        )
+        assert len(historical) == 50
+        assert all(job.status == "queued" for job in historical)
 
 
 async def test_job_read_uses_current_attempt_engine_mode_through_terminal_and_retry(
@@ -365,6 +469,82 @@ async def test_job_read_uses_current_attempt_engine_mode_through_terminal_and_re
     )
     assert retried_list.status_code == 200, retried_list.text
     assert retried_list.json()["items"][0]["current_attempt_engine_mode"] is None
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "attempt_hash_null",
+        "attempt_hash_mismatch",
+        "raw_config_mismatch",
+        "missing_current_attempt",
+        "invalid_engine_mode",
+    ],
+)
+async def test_job_public_reads_fail_closed_for_invalid_current_attempt_evidence(
+    tamper: str,
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    _, token = await register_worker(
+        client,
+        f"public-read-attempt-integrity-{tamper}",
+        engine_mode="fake",
+    )
+    _, experiment_id, job_id = await create_job(client, admin_headers)
+    assignment = (await claim(client, token)).json()
+
+    if tamper == "attempt_hash_mismatch":
+        # Simulate a pre-constraint/corrupted ledger. Normal writes cannot
+        # create this row because the composite Job/attempt FK is enabled.
+        async with app.state.database.engine.connect() as connection:
+            await connection.exec_driver_sql("PRAGMA foreign_keys = OFF")
+            try:
+                result = await connection.exec_driver_sql(
+                    "UPDATE job_attempts SET job_config_sha256 = ? WHERE id = ?",
+                    ("0" * 64, assignment["attempt_id"]),
+                )
+                assert result.rowcount == 1
+                await connection.commit()
+            finally:
+                if connection.in_transaction():
+                    await connection.rollback()
+                await connection.exec_driver_sql("PRAGMA foreign_keys = ON")
+                await connection.commit()
+    else:
+        async with app.state.database.session_factory() as session:
+            job = await session.get(Job, job_id)
+            attempt = await session.get(JobAttempt, assignment["attempt_id"])
+            assert job is not None
+            assert attempt is not None
+            if tamper == "attempt_hash_null":
+                attempt.job_config_sha256 = None
+            elif tamper == "raw_config_mismatch":
+                document = dict(job.config_json)
+                artifacts = dict(document["artifacts"])
+                artifacts["collect_logs"] = not artifacts["collect_logs"]
+                document["artifacts"] = artifacts
+                job.config_json = document
+            elif tamper == "missing_current_attempt":
+                job.current_attempt_id = new_id()
+            else:
+                attempt.engine_mode = "untrusted-engine"
+            await session.commit()
+
+    detail = await client.get(f"/api/v1/jobs/{job_id}", headers=admin_headers)
+    listed = await client.get(
+        "/api/v1/jobs",
+        headers=admin_headers,
+        params={"experiment_id": experiment_id},
+    )
+    for response in (detail, listed):
+        assert response.status_code == 409
+        body = response.json()
+        assert body == {"detail": "job configuration integrity check failed"}
+        assert "config" not in body
+        assert "current_attempt_engine_mode" not in body
+        assert "fake" not in response.text
 
 
 async def test_lease_renewal_does_not_contend_with_versioned_worker_heartbeat(
@@ -1315,6 +1495,7 @@ async def test_failed_job_retry_preserves_attempt_history(
     _, token = await register_worker(client, "gpu-01")
     _, _, job_id = await create_job(client, admin_headers)
     first_claim = (await claim(client, token)).json()
+    config_sha256 = first_claim["config_sha256"]
     failed = await client.post(
         f"/api/v1/workers/jobs/{job_id}/status",
         headers={"Authorization": f"Bearer {token}"},
@@ -1333,15 +1514,247 @@ async def test_failed_job_retry_preserves_attempt_history(
     assert retried.status_code == 200, retried.text
     assert retried.json()["status"] == "queued"
     assert retried.json()["attempt_count"] == 1
+    assert retried.json()["config_sha256"] == config_sha256
 
     second_claim_response = await claim(client, token)
     assert second_claim_response.status_code == 200, second_claim_response.text
     assert second_claim_response.json()["attempt_number"] == 2
+    assert second_claim_response.json()["config_sha256"] == config_sha256
     async with app.state.database.session_factory() as session:
         attempts = list(
             (await session.scalars(select(JobAttempt).where(JobAttempt.job_id == job_id))).all()
         )
         assert [attempt.attempt_number for attempt in attempts] == [1, 2]
+        assert [attempt.job_config_sha256 for attempt in attempts] == [
+            config_sha256,
+            config_sha256,
+        ]
+
+
+async def test_retry_rejects_a_tampered_config_without_mutating_failed_job(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    _, token = await register_worker(client, "gpu-retry-config-integrity")
+    _, _, job_id = await create_job(client, admin_headers)
+    assignment = (await claim(client, token)).json()
+    failed = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/status",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "lease_id": assignment["lease_id"],
+            "status": "failed",
+            "error_code": "RVC_PROCESS_EXITED",
+            "error_message": "training process exited",
+        },
+    )
+    assert failed.status_code == 200, failed.text
+    async with app.state.database.session_factory() as session:
+        job = await session.get(Job, job_id)
+        assert job is not None
+        document = dict(job.config_json)
+        artifacts = dict(document["artifacts"])
+        artifacts["collect_logs"] = not artifacts["collect_logs"]
+        document["artifacts"] = artifacts
+        job.config_json = document
+        await session.commit()
+
+    retried = await client.post(f"/api/v1/jobs/{job_id}/retry", headers=admin_headers)
+    assert retried.status_code == 409
+    assert retried.json()["detail"] == "job configuration integrity check failed"
+
+    async with app.state.database.session_factory() as session:
+        job = await session.get(Job, job_id)
+        attempt = await session.get(JobAttempt, assignment["attempt_id"])
+        events = list(
+            (
+                await session.scalars(select(JobStatusEvent).where(JobStatusEvent.job_id == job_id))
+            ).all()
+        )
+        assert job is not None and job.status == "failed"
+        assert job.current_attempt_id == assignment["attempt_id"]
+        assert attempt is not None and attempt.status == "failed"
+        assert all(event.status != "retrying" for event in events)
+
+
+async def test_retry_rejects_a_missing_current_attempt_config_hash(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    _, token = await register_worker(client, "gpu-retry-attempt-integrity")
+    _, _, job_id = await create_job(client, admin_headers)
+    assignment = (await claim(client, token)).json()
+    failed = await client.post(
+        f"/api/v1/workers/jobs/{job_id}/status",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "lease_id": assignment["lease_id"],
+            "status": "failed",
+            "error_code": "RVC_PROCESS_EXITED",
+            "error_message": "training process exited",
+        },
+    )
+    assert failed.status_code == 200, failed.text
+    async with app.state.database.session_factory() as session:
+        attempt = await session.get(JobAttempt, assignment["attempt_id"])
+        assert attempt is not None
+        attempt.job_config_sha256 = None
+        await session.commit()
+
+    retried = await client.post(f"/api/v1/jobs/{job_id}/retry", headers=admin_headers)
+    assert retried.status_code == 409
+    assert retried.json()["detail"] == "job configuration integrity check failed"
+    async with app.state.database.session_factory() as session:
+        job = await session.get(Job, job_id)
+        attempt = await session.get(JobAttempt, assignment["attempt_id"])
+        assert job is not None and job.status == "failed"
+        assert job.current_attempt_id == assignment["attempt_id"]
+        assert attempt is not None and attempt.status == "failed"
+
+
+async def test_lease_recovery_does_not_requeue_an_unbound_attempt(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    worker_id, first_token = await register_worker(client, "gpu-recovery-attempt-integrity")
+    _, second_token = await register_worker(client, "gpu-recovery-attempt-integrity-next")
+    _, _, job_id = await create_job(client, admin_headers)
+    assignment = (await claim(client, first_token)).json()
+    async with app.state.database.session_factory() as session:
+        attempt = await session.get(JobAttempt, assignment["attempt_id"])
+        lease = await session.get(JobLease, assignment["lease_id"])
+        worker = await session.get(Worker, worker_id)
+        assert attempt is not None and lease is not None and worker is not None
+        attempt.job_config_sha256 = None
+        lease.expires_at = utc_now() - timedelta(seconds=1)
+        worker.last_heartbeat_at = utc_now() - timedelta(
+            seconds=app.state.settings.worker_offline_seconds + 1
+        )
+        await session.commit()
+
+    assert (await claim(client, second_token)).status_code == 204
+    async with app.state.database.session_factory() as session:
+        job = await session.get(Job, job_id)
+        attempt = await session.get(JobAttempt, assignment["attempt_id"])
+        lease = await session.get(JobLease, assignment["lease_id"])
+        assert job is not None and job.status == "failed"
+        assert job.current_attempt_id == assignment["attempt_id"]
+        assert job.error_code == "job_config_integrity_failed"
+        assert attempt is not None and attempt.status == "failed"
+        assert attempt.error_code == "job_config_integrity_failed"
+        assert lease is not None and lease.active is False
+
+
+async def test_post_claim_config_tamper_blocks_worker_mutations_and_completion(
+    app: FastAPI,
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    worker_id, token = await register_worker(
+        client,
+        "gpu-post-claim-config-integrity",
+        engine_mode="fake",
+    )
+    _, _, job_id = await create_job(client, admin_headers)
+    assignment = (await claim(client, token)).json()
+    auth = {"Authorization": f"Bearer {token}"}
+    for target in (
+        "downloading_dataset",
+        "validating_dataset",
+        "preparing_flat_dataset",
+        "preprocessing",
+        "extracting_f0",
+        "extracting_features",
+        "training",
+        "saving_checkpoint",
+        "building_index",
+        "collecting_small_model",
+        "uploading_artifacts",
+    ):
+        response = await client.post(
+            f"/api/v1/workers/jobs/{job_id}/status",
+            headers=auth,
+            json={"lease_id": assignment["lease_id"], "status": target},
+        )
+        assert response.status_code == 200, response.text
+
+    async with app.state.database.session_factory() as session:
+        job = await session.get(Job, job_id)
+        assert job is not None
+        document = dict(job.config_json)
+        artifacts = dict(document["artifacts"])
+        artifacts["collect_small_model"] = False
+        artifacts["collect_index"] = False
+        document["artifacts"] = artifacts
+        index = dict(document["index"])
+        index["build_index"] = False
+        document["index"] = index
+        job.config_json = document
+        await session.commit()
+
+    requests = (
+        await client.post(
+            "/api/v1/workers/heartbeat",
+            headers=auth,
+            json={
+                "status": "busy",
+                "capabilities": capabilities(engine_mode="fake"),
+                "current_job_id": job_id,
+                "current_lease_id": assignment["lease_id"],
+            },
+        ),
+        await client.post(
+            f"/api/v1/workers/jobs/{job_id}/lease/renew",
+            headers=auth,
+            json={"lease_id": assignment["lease_id"]},
+        ),
+        await client.post(
+            f"/api/v1/workers/jobs/{job_id}/logs",
+            headers=auth,
+            json={
+                "lease_id": assignment["lease_id"],
+                "attempt_id": assignment["attempt_id"],
+                "idempotency_key": "tampered-config-log",
+                "entries": [{"sequence": 0, "message": "must not persist"}],
+            },
+        ),
+        await client.post(
+            f"/api/v1/workers/jobs/{job_id}/metrics",
+            headers=auth,
+            json={
+                "lease_id": assignment["lease_id"],
+                "attempt_id": assignment["attempt_id"],
+                "idempotency_key": "tampered-config-metric",
+                "entries": [{"sequence": 0, "key": "loss_g_total", "value": 1.0}],
+            },
+        ),
+        await client.post(
+            f"/api/v1/workers/jobs/{job_id}/status",
+            headers=auth,
+            json={"lease_id": assignment["lease_id"], "status": "completed"},
+        ),
+    )
+    assert all(response.status_code == 409 for response in requests)
+    assert all(
+        response.json()["detail"] == "job configuration integrity check failed"
+        for response in requests
+    )
+
+    async with app.state.database.session_factory() as session:
+        job = await session.get(Job, job_id)
+        attempt = await session.get(JobAttempt, assignment["attempt_id"])
+        lease = await session.get(JobLease, assignment["lease_id"])
+        worker = await session.get(Worker, worker_id)
+        assert job is not None and job.status == "uploading_artifacts"
+        assert attempt is not None and attempt.status == "uploading_artifacts"
+        assert lease is not None and lease.active is True
+        assert worker is not None and worker.current_job_id == job_id
+        assert not list((await session.scalars(select(JobLog))).all())
+        assert not list((await session.scalars(select(Metric))).all())
+        assert not list((await session.scalars(select(IngestBatch))).all())
 
 
 async def test_completion_requires_model_and_index_artifacts(

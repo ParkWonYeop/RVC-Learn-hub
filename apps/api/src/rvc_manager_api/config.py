@@ -68,6 +68,19 @@ class Settings(BaseSettings):
     artifact_max_bytes: int = Field(default=5 * 1024**3, ge=1, le=5 * 1024**3)
     artifact_stream_chunk_bytes: int = Field(default=1024**2, ge=64 * 1024, le=8 * 1024**2)
     artifact_verification_spool_dir: Path | None = None
+    artifact_upload_write_heartbeat_seconds: int = Field(default=15, ge=1, le=300)
+    artifact_staging_cleanup_grace_seconds: int = Field(default=7_200, ge=300, le=86_400)
+    artifact_cleanup_confirmation_grace_seconds: int = Field(default=60, ge=30, le=3_600)
+    artifact_cleanup_claim_stale_seconds: int = Field(default=300, ge=60, le=7_200)
+    artifact_cleanup_heartbeat_seconds: int = Field(default=15, ge=1, le=300)
+    artifact_cleanup_reconcile_enabled: bool = True
+    artifact_cleanup_reconcile_interval_seconds: float = Field(
+        default=30.0,
+        ge=0.25,
+        le=300.0,
+    )
+    artifact_cleanup_reconcile_stale_seconds: int = Field(default=120, ge=5, le=3_600)
+    artifact_cleanup_reconcile_batch_size: int = Field(default=32, ge=1, le=256)
     artifact_finalizing_stale_seconds: int = Field(default=7200, ge=60, le=86_400)
     artifact_retry_after_seconds: int = Field(default=5, ge=1, le=60)
     artifact_attempt_max_sessions: int = Field(default=256, ge=1, le=10_000)
@@ -285,6 +298,40 @@ class Settings(BaseSettings):
                 "DATASET_MAX_FILE_UNCOMPRESSED_BYTES must not exceed "
                 "DATASET_MAX_TOTAL_UNCOMPRESSED_BYTES"
             )
+        if self.artifact_upload_write_heartbeat_seconds * 3 >= self.artifact_upload_ttl_seconds:
+            raise ValueError(
+                "ARTIFACT_UPLOAD_WRITE_HEARTBEAT_SECONDS must be less than one third of "
+                "ARTIFACT_UPLOAD_TTL_SECONDS"
+            )
+        if self.artifact_staging_cleanup_grace_seconds < self.artifact_upload_ttl_seconds:
+            raise ValueError(
+                "ARTIFACT_STAGING_CLEANUP_GRACE_SECONDS must be at least "
+                "ARTIFACT_UPLOAD_TTL_SECONDS"
+            )
+        if (
+            self.artifact_cleanup_heartbeat_seconds * 3
+            >= self.artifact_cleanup_claim_stale_seconds
+        ):
+            raise ValueError(
+                "ARTIFACT_CLEANUP_HEARTBEAT_SECONDS must be less than one third of "
+                "ARTIFACT_CLEANUP_CLAIM_STALE_SECONDS"
+            )
+        if (
+            self.artifact_cleanup_confirmation_grace_seconds
+            < self.artifact_cleanup_reconcile_interval_seconds
+        ):
+            raise ValueError(
+                "ARTIFACT_CLEANUP_CONFIRMATION_GRACE_SECONDS must be at least "
+                "ARTIFACT_CLEANUP_RECONCILE_INTERVAL_SECONDS"
+            )
+        if (
+            self.artifact_cleanup_reconcile_stale_seconds
+            <= self.artifact_cleanup_reconcile_interval_seconds * 2
+        ):
+            raise ValueError(
+                "ARTIFACT_CLEANUP_RECONCILE_STALE_SECONDS must be greater than twice "
+                "ARTIFACT_CLEANUP_RECONCILE_INTERVAL_SECONDS"
+            )
         if self.dataset_finalizing_heartbeat_seconds * 3 >= self.dataset_finalizing_stale_seconds:
             raise ValueError(
                 "DATASET_FINALIZING_HEARTBEAT_SECONDS must be less than one third of "
@@ -400,6 +447,11 @@ class Settings(BaseSettings):
             if self.allow_fake_workers:
                 raise ValueError("ALLOW_FAKE_WORKERS cannot be enabled in production")
             if self.process_role == "api":
+                if not self.artifact_cleanup_reconcile_enabled:
+                    raise ValueError(
+                        "ARTIFACT_CLEANUP_RECONCILE_ENABLED cannot be disabled "
+                        "for the production API"
+                    )
                 if jwt_secret_value == "development-only-jwt-secret-change-me":
                     raise ValueError("JWT_SECRET must be overridden in production")
                 if self.worker_bootstrap_token is None:

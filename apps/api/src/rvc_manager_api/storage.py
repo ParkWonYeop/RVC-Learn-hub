@@ -399,10 +399,12 @@ class S3StorageAdapter(StorageAdapter):
             "ContentType": content_type,
             "ContentLength": content_length,
             "Metadata": {"sha256": sha256},
+            "IfNoneMatch": "*",
         }
         headers = {
             "Content-Type": content_type,
             "Content-Length": str(content_length),
+            "If-None-Match": "*",
             "x-amz-meta-sha256": sha256,
         }
         if self.bind_checksum:

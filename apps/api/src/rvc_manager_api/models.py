@@ -594,7 +594,13 @@ class Job(Base, TimestampMixin):
         UniqueConstraint("experiment_id", "job_name", name="uq_jobs_experiment_job_name"),
         Index("uq_job_id_experiment", "id", "experiment_id", unique=True),
         UniqueConstraint("id", "test_set_id", name="uq_job_test_set_snapshot"),
+        Index("uq_job_id_config_sha256", "id", "config_sha256", unique=True),
         Index("ix_jobs_claim_order", "status", "priority", "created_at"),
+        CheckConstraint(
+            "config_sha256 IS NULL OR "
+            "(length(config_sha256) = 64 AND config_sha256 = lower(config_sha256))",
+            name="config_sha256_shape",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -614,6 +620,7 @@ class Job(Base, TimestampMixin):
         String(40), default=JobStatus.QUEUED.value, nullable=False, index=True
     )
     config_json: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, nullable=False)
+    config_sha256: Mapped[str | None] = mapped_column(String(64))
     test_set_id: Mapped[str | None] = mapped_column(
         ForeignKey("test_sets.id", ondelete="RESTRICT"), index=True
     )
@@ -639,6 +646,12 @@ class JobAttempt(Base):
     __table_args__ = (
         UniqueConstraint("job_id", "attempt_number", name="uq_job_attempt_number"),
         UniqueConstraint("id", "job_id", name="uq_job_attempt_id_job"),
+        ForeignKeyConstraint(
+            ["job_id", "job_config_sha256"],
+            ["jobs.id", "jobs.config_sha256"],
+            name="fk_job_attempt_job_config_snapshot",
+            ondelete="CASCADE",
+        ),
         CheckConstraint(
             "(telemetry_log_count IS NULL AND telemetry_metric_count IS NULL) OR "
             "(telemetry_log_count IS NOT NULL AND telemetry_metric_count IS NOT NULL)",
@@ -668,6 +681,12 @@ class JobAttempt(Base):
             "execution_provenance_version = 'worker-claim-v1'",
             name="execution_provenance_version_allowed",
         ),
+        CheckConstraint(
+            "job_config_sha256 IS NULL OR "
+            "(length(job_config_sha256) = 64 "
+            "AND job_config_sha256 = lower(job_config_sha256))",
+            name="job_config_sha256_shape",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -681,6 +700,7 @@ class JobAttempt(Base):
     engine_mode: Mapped[str] = mapped_column(String(32), nullable=False)
     rvc_commit_hash: Mapped[str | None] = mapped_column(String(64))
     execution_provenance_version: Mapped[str | None] = mapped_column(String(32))
+    job_config_sha256: Mapped[str | None] = mapped_column(String(64))
     runtime_image_digest: Mapped[str | None] = mapped_column(String(71))
     runtime_asset_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
     telemetry_log_count: Mapped[int | None] = mapped_column(Integer)
@@ -881,12 +901,29 @@ class ArtifactUploadSession(Base, TimestampMixin):
     storage_backend: Mapped[str] = mapped_column(String(16), nullable=False)
     storage_namespace_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    upload_write_token: Mapped[str | None] = mapped_column(String(36))
+    upload_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finalization_token: Mapped[str | None] = mapped_column(String(36))
+    cleanup_token: Mapped[str | None] = mapped_column(String(36))
+    cleanup_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     upload_token_hash: Mapped[str | None] = mapped_column(String(64))
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    staging_cleanup_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    staging_cleanup_first_deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    canonical_cleanup_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    canonical_cleanup_first_deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     failure_code: Mapped[str | None] = mapped_column(String(64))
 
 
@@ -894,9 +931,7 @@ class ExperimentModelRegistry(Base, TimestampMixin):
     """Versioned mutation fence for one Experiment's reviewed model entries."""
 
     __tablename__ = "experiment_model_registries"
-    __table_args__ = (
-        CheckConstraint("row_version >= 1", name="row_version_positive"),
-    )
+    __table_args__ = (CheckConstraint("row_version >= 1", name="row_version_positive"),)
 
     experiment_id: Mapped[str] = mapped_column(
         ForeignKey("experiments.id", ondelete="RESTRICT"), primary_key=True
@@ -1056,12 +1091,8 @@ class ModelRegistryEntry(Base, TimestampMixin):
     created_by: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
-    approved_by: Mapped[str | None] = mapped_column(
-        ForeignKey("users.id", ondelete="RESTRICT")
-    )
-    revoked_by: Mapped[str | None] = mapped_column(
-        ForeignKey("users.id", ondelete="RESTRICT")
-    )
+    approved_by: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    revoked_by: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoke_reason: Mapped[str | None] = mapped_column(String(32))
@@ -1087,8 +1118,7 @@ class ModelRegistryOperation(Base):
             name="idempotency_key_hash_format",
         ),
         CheckConstraint(
-            "length(request_fingerprint) = 64 "
-            "AND request_fingerprint = lower(request_fingerprint)",
+            "length(request_fingerprint) = 64 AND request_fingerprint = lower(request_fingerprint)",
             name="request_fingerprint_format",
         ),
         ForeignKeyConstraint(

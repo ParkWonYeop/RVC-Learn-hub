@@ -27,7 +27,12 @@ from rvc_manager_api.models import (
 )
 from rvc_manager_api.security import hash_password
 from rvc_manager_api.services.artifacts import canonical_object_key
-from rvc_orchestrator_contracts import RVC_REVIEWED_COMMIT, JobConfig, utc_now
+from rvc_orchestrator_contracts import (
+    RVC_REVIEWED_COMMIT,
+    JobConfig,
+    job_config_sha256,
+    utc_now,
+)
 
 USER_PASSWORD = "experiment-comparison-password-1234"
 _RUNTIME_DIGEST = f"sha256:{'1' * 64}"
@@ -327,6 +332,10 @@ async def _seed_completed_comparison_ledgers(
                 job.test_set_id = test_set.id
                 job.sample_plan_json = {"version": "test"}
                 job.sample_plan_sha256 = "7" * 64
+            normalized_config = JobConfig.model_validate(job.config_json).model_dump(mode="json")
+            job.config_json = normalized_config
+            job.config_sha256 = job_config_sha256(normalized_config)
+            attempt.job_config_sha256 = job.config_sha256
             attempts[job_id] = attempt
             leases[job_id] = lease
 
@@ -664,6 +673,7 @@ async def test_comparison_rejects_invalid_selection_stale_attempt_and_non_finite
             job.current_epoch = job.total_epoch
             job.started_at = attempt.started_at
             job.completed_at = attempt.finished_at
+            attempt.job_config_sha256 = job.config_sha256
             attempts[job_id] = attempt
         await session.commit()
 
@@ -702,6 +712,19 @@ async def test_comparison_rejects_invalid_selection_stale_attempt_and_non_finite
         await session.commit()
     recovered = await client.get(url, headers=headers, params=_comparison_params(job_ids))
     assert recovered.status_code == 200, recovered.text
+
+    async with app.state.database.session_factory() as session:
+        first = await session.get(Job, job_ids[0])
+        assert first is not None
+        document = dict(first.config_json)
+        artifacts = dict(document["artifacts"])
+        artifacts["collect_logs"] = not artifacts["collect_logs"]
+        document["artifacts"] = artifacts
+        first.config_json = document
+        await session.commit()
+    stale_config = await client.get(url, headers=headers, params=_comparison_params(job_ids))
+    assert stale_config.status_code == 409
+    assert stale_config.json()["detail"] == "selected job comparison ledger is inconsistent"
 
 
 async def test_comparison_openapi_documents_explicit_bounded_job_ids(client: AsyncClient) -> None:

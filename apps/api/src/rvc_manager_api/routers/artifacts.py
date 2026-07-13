@@ -4,12 +4,13 @@ import asyncio
 import math
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import timedelta
 from pathlib import Path
-from typing import Annotated, cast
+from typing import Annotated, Literal, TypeVar, cast
 from urllib.parse import urlsplit
 
+import anyio
 from fastapi import (
     APIRouter,
     Depends,
@@ -22,8 +23,9 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import ValidationError
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.attributes import set_committed_value
 from starlette.types import Receive, Scope, Send
 
 from rvc_orchestrator_contracts import (
@@ -42,6 +44,7 @@ from rvc_orchestrator_contracts import (
 )
 
 from ..audit import add_audit_event
+from ..database import Database
 from ..dependencies import CurrentUserDep, MlflowDep, SessionDep, SettingsDep, WorkerDep
 from ..models import (
     Artifact,
@@ -59,6 +62,7 @@ from ..schemas import (
     ArtifactUploadInitRequest,
     ArtifactUploadInitResponse,
 )
+from ..services.artifact_cleanup import reconcile_artifact_upload_cleanup
 from ..services.artifacts import (
     ArtifactSpoolError,
     ArtifactVerificationMismatch,
@@ -77,11 +81,15 @@ from ..services.artifacts import (
     verify_upload_token,
 )
 from ..services.authorization import require_job_owner_or_admin
+from ..services.job_configs import InvalidJobConfigLedger, validated_job_config
 from ..services.mlflow import artifact_event_key
 from ..services.samples import (
     InvalidSampleWav,
     SamplePcmInspection,
+    SampleRegistrationFenceConflict,
+    SampleRegistrationFenceUnavailable,
     SampleStorageUnavailable,
+    acquire_sample_registration_job_fence,
     artifact_provenance_matches,
     inspect_sample_pcm_wav,
     sample_matches_registration,
@@ -103,6 +111,20 @@ from ..storage import (
 )
 
 router = APIRouter(tags=["artifacts"])
+
+_T = TypeVar("_T")
+
+
+class ArtifactFinalizationOwnershipLost(Exception):
+    """The finalizer token changed while an external operation was running."""
+
+    def __init__(self, result: object | None = None) -> None:
+        super().__init__("artifact finalization ownership was lost")
+        self.result = result
+
+
+class ArtifactUploadWriteOwnershipLost(Exception):
+    """The local upload writer token changed while its body was streaming."""
 
 
 class _VerifiedSampleFileResponse(FileResponse):
@@ -304,6 +326,9 @@ async def _recover_stale_finalizing(
         )
         .values(
             status="pending",
+            upload_write_token=None,
+            upload_heartbeat_at=None,
+            finalization_token=None,
             failure_code="stale_finalizing_recovered",
             updated_at=utc_now(),
         )
@@ -314,37 +339,313 @@ async def _recover_stale_finalizing(
         await session.refresh(upload)
         return False
     await session.commit()
-    upload.status = "pending"
-    upload.failure_code = "stale_finalizing_recovered"
+    set_committed_value(upload, "status", "pending")
+    set_committed_value(upload, "upload_write_token", None)
+    set_committed_value(upload, "upload_heartbeat_at", None)
+    set_committed_value(upload, "finalization_token", None)
+    set_committed_value(upload, "failure_code", "stale_finalizing_recovered")
     return True
 
 
 async def _reset_finalizing_to_pending(
     upload: ArtifactUploadSession,
     *,
+    finalization_token: str,
     failure_code: str,
     session: SessionDep,
 ) -> bool:
-    reset = await session.execute(
+    return await _transition_owned_finalizing(
+        upload,
+        finalization_token=finalization_token,
+        status="pending",
+        failure_code=failure_code,
+        session=session,
+    )
+
+
+async def _transition_owned_finalizing(
+    upload: ArtifactUploadSession,
+    *,
+    finalization_token: str,
+    status: Literal["pending", "failed", "expired"],
+    failure_code: str,
+    session: SessionDep,
+) -> bool:
+    values: dict[str, object] = {
+        "status": status,
+        "upload_write_token": None,
+        "upload_heartbeat_at": None,
+        "finalization_token": None,
+        "failure_code": failure_code,
+        "updated_at": utc_now(),
+    }
+    if status in {"failed", "expired"}:
+        values["dedupe_key"] = None
+        values["finalized_at"] = utc_now()
+    transitioned = await session.execute(
         update(ArtifactUploadSession)
         .where(
             ArtifactUploadSession.id == upload.id,
             ArtifactUploadSession.status == "finalizing",
+            ArtifactUploadSession.finalization_token == finalization_token,
         )
-        .values(
-            status="pending",
-            failure_code=failure_code,
-            updated_at=utc_now(),
-        )
+        .values(**values)
+        .execution_options(synchronize_session=False)
     )
-    if reset.rowcount != 1:  # type: ignore[attr-defined]
+    if transitioned.rowcount != 1:  # type: ignore[attr-defined]
         await session.rollback()
-        await session.refresh(upload)
         return False
     await session.commit()
-    upload.status = "pending"
-    upload.failure_code = failure_code
+    set_committed_value(upload, "status", status)
+    set_committed_value(upload, "upload_write_token", None)
+    set_committed_value(upload, "upload_heartbeat_at", None)
+    set_committed_value(upload, "finalization_token", None)
+    set_committed_value(upload, "failure_code", failure_code)
+    if status in {"failed", "expired"}:
+        set_committed_value(upload, "dedupe_key", None)
+        set_committed_value(upload, "finalized_at", values["finalized_at"])
     return True
+
+
+async def _heartbeat_owned_finalizing(
+    upload: ArtifactUploadSession,
+    *,
+    finalization_token: str,
+    session: SessionDep,
+) -> bool:
+    heartbeat_at = utc_now()
+    heartbeat = await session.execute(
+        update(ArtifactUploadSession)
+        .where(
+            ArtifactUploadSession.id == upload.id,
+            ArtifactUploadSession.status == "finalizing",
+            ArtifactUploadSession.finalization_token == finalization_token,
+        )
+        .values(updated_at=heartbeat_at)
+        .execution_options(synchronize_session=False)
+    )
+    if heartbeat.rowcount != 1:  # type: ignore[attr-defined]
+        await session.rollback()
+        return False
+    await session.commit()
+    set_committed_value(upload, "updated_at", heartbeat_at)
+    return True
+
+
+async def _touch_artifact_finalization(
+    database: Database,
+    *,
+    upload_id: str,
+    finalization_token: str,
+) -> bool:
+    """Refresh one finalizer token using a connection independent of the request."""
+
+    heartbeat_at = utc_now()
+    async with database.session_factory() as heartbeat_session:
+        heartbeat = await heartbeat_session.execute(
+            update(ArtifactUploadSession)
+            .where(
+                ArtifactUploadSession.id == upload_id,
+                ArtifactUploadSession.status == "finalizing",
+                ArtifactUploadSession.finalization_token == finalization_token,
+            )
+            .values(updated_at=heartbeat_at)
+            .execution_options(synchronize_session=False)
+        )
+        await heartbeat_session.commit()
+    return bool(heartbeat.rowcount == 1)  # type: ignore[attr-defined]
+
+
+async def _run_with_artifact_finalization_heartbeat(
+    operation: Callable[[], Awaitable[_T]],
+    *,
+    database: Database,
+    upload_id: str,
+    finalization_token: str,
+    heartbeat_seconds: int,
+) -> _T:
+    """Run storage work while keeping the exact finalizer token live."""
+
+    if not await _touch_artifact_finalization(
+        database,
+        upload_id=upload_id,
+        finalization_token=finalization_token,
+    ):
+        raise ArtifactFinalizationOwnershipLost
+
+    done = anyio.Event()
+    results: list[_T] = []
+    errors: list[BaseException] = []
+
+    async def run_operation() -> None:
+        try:
+            results.append(await operation())
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    ownership_lost = False
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(run_operation)
+        while not done.is_set():
+            with anyio.move_on_after(heartbeat_seconds):
+                await done.wait()
+            if done.is_set():
+                break
+            if not await _touch_artifact_finalization(
+                database,
+                upload_id=upload_id,
+                finalization_token=finalization_token,
+            ):
+                ownership_lost = True
+                await done.wait()
+                break
+        task_group.cancel_scope.cancel()
+
+    if not ownership_lost:
+        ownership_lost = not await _touch_artifact_finalization(
+            database,
+            upload_id=upload_id,
+            finalization_token=finalization_token,
+        )
+    if ownership_lost:
+        result = results[0] if results else None
+        raise ArtifactFinalizationOwnershipLost(result)
+    if errors:
+        raise errors[0]
+    return results[0]
+
+
+async def _touch_artifact_upload_write(
+    database: Database,
+    *,
+    upload_id: str,
+    write_token: str,
+) -> bool:
+    heartbeat_at = utc_now()
+    async with database.session_factory() as heartbeat_session:
+        heartbeat = await heartbeat_session.execute(
+            update(ArtifactUploadSession)
+            .where(
+                ArtifactUploadSession.id == upload_id,
+                ArtifactUploadSession.status == "pending",
+                ArtifactUploadSession.upload_write_token == write_token,
+                ArtifactUploadSession.uploaded_at.is_(None),
+                ArtifactUploadSession.expires_at > heartbeat_at,
+            )
+            .values(upload_heartbeat_at=heartbeat_at, updated_at=heartbeat_at)
+            .execution_options(synchronize_session=False)
+        )
+        await heartbeat_session.commit()
+    return bool(heartbeat.rowcount == 1)  # type: ignore[attr-defined]
+
+
+async def _clear_artifact_upload_write(
+    database: Database,
+    *,
+    upload_id: str,
+    write_token: str,
+) -> bool:
+    async with database.session_factory() as claim_session:
+        cleared = await claim_session.execute(
+            update(ArtifactUploadSession)
+            .where(
+                ArtifactUploadSession.id == upload_id,
+                ArtifactUploadSession.status == "pending",
+                ArtifactUploadSession.upload_write_token == write_token,
+                ArtifactUploadSession.uploaded_at.is_(None),
+            )
+            .values(
+                upload_write_token=None,
+                upload_heartbeat_at=None,
+                updated_at=utc_now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await claim_session.commit()
+    return bool(cleared.rowcount == 1)  # type: ignore[attr-defined]
+
+
+async def _expire_artifact_upload_write(
+    database: Database,
+    *,
+    upload_id: str,
+    write_token: str,
+) -> bool:
+    async with database.session_factory() as claim_session:
+        expired = await claim_session.execute(
+            update(ArtifactUploadSession)
+            .where(
+                ArtifactUploadSession.id == upload_id,
+                ArtifactUploadSession.status == "pending",
+                ArtifactUploadSession.upload_write_token == write_token,
+                ArtifactUploadSession.uploaded_at.is_(None),
+            )
+            .values(
+                status="expired",
+                upload_write_token=None,
+                upload_heartbeat_at=None,
+                failure_code="upload_write_deadline_exceeded",
+                dedupe_key=None,
+                finalized_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await claim_session.commit()
+    return bool(expired.rowcount == 1)  # type: ignore[attr-defined]
+
+
+async def _run_with_artifact_upload_write_heartbeat(
+    operation: Callable[[], Awaitable[_T]],
+    *,
+    database: Database,
+    upload_id: str,
+    write_token: str,
+    heartbeat_seconds: int,
+) -> _T:
+    async def heartbeat() -> bool:
+        return await _touch_artifact_upload_write(
+            database,
+            upload_id=upload_id,
+            write_token=write_token,
+        )
+
+    if not await heartbeat():
+        raise ArtifactUploadWriteOwnershipLost
+    done = anyio.Event()
+    results: list[_T] = []
+    errors: list[BaseException] = []
+
+    async def run_operation() -> None:
+        try:
+            results.append(await operation())
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    ownership_lost = False
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(run_operation)
+        while not done.is_set():
+            with anyio.move_on_after(heartbeat_seconds):
+                await done.wait()
+            if done.is_set():
+                break
+            if not await heartbeat():
+                ownership_lost = True
+                await done.wait()
+                break
+        task_group.cancel_scope.cancel()
+    if not ownership_lost:
+        ownership_lost = not await heartbeat()
+    if ownership_lost:
+        raise ArtifactUploadWriteOwnershipLost
+    if errors:
+        raise errors[0]
+    return results[0]
 
 
 async def _enforce_attempt_artifact_quota(
@@ -357,13 +658,23 @@ async def _enforce_attempt_artifact_quota(
     await session.execute(
         select(JobAttempt.id).where(JobAttempt.id == attempt_id).with_for_update()
     )
+    quota_session = or_(
+        ArtifactUploadSession.status.in_(("pending", "finalizing", "completed")),
+        and_(
+            ArtifactUploadSession.status.in_(("failed", "expired")),
+            or_(
+                ArtifactUploadSession.staging_cleanup_completed_at.is_(None),
+                ArtifactUploadSession.canonical_cleanup_completed_at.is_(None),
+            ),
+        ),
+    )
     session_count = (
         await session.scalar(
             select(func.count())
             .select_from(ArtifactUploadSession)
             .where(
                 ArtifactUploadSession.attempt_id == attempt_id,
-                ArtifactUploadSession.status.in_(("pending", "finalizing", "completed")),
+                quota_session,
             )
         )
         or 0
@@ -374,7 +685,7 @@ async def _enforce_attempt_artifact_quota(
         await session.scalar(
             select(func.coalesce(func.sum(ArtifactUploadSession.expected_size_bytes), 0)).where(
                 ArtifactUploadSession.attempt_id == attempt_id,
-                ArtifactUploadSession.status.in_(("pending", "finalizing", "completed")),
+                quota_session,
             )
         )
         or 0
@@ -383,26 +694,84 @@ async def _enforce_attempt_artifact_quota(
         raise HTTPException(status_code=409, detail="artifact byte quota exceeded")
 
 
+async def _cleanup_terminal_artifact_staging(
+    upload: ArtifactUploadSession,
+    *,
+    database: Database,
+    storage: StorageAdapter,
+    settings: SettingsDep,
+    session: SessionDep,
+) -> bool:
+    """Run the claimed reconciler; S3 completion requires its second delete."""
+    if upload.status not in {"completed", "failed", "expired"}:
+        return False
+    upload_id = upload.id
+    await session.rollback()
+    await reconcile_artifact_upload_cleanup(
+        database,
+        storage,
+        settings,
+        upload_ids=(upload_id,),
+    )
+    refreshed = await session.scalar(
+        select(ArtifactUploadSession)
+        .where(ArtifactUploadSession.id == upload_id)
+        .execution_options(populate_existing=True)
+    )
+    if refreshed is None:
+        return False
+    completed = refreshed.staging_cleanup_completed_at is not None
+    await session.rollback()
+    return completed
+
+
 async def _expire_upload(
     upload: ArtifactUploadSession,
     *,
+    database: Database,
     storage: StorageAdapter,
+    settings: SettingsDep,
     session: SessionDep,
-) -> None:
+) -> bool:
     if not _upload_storage_matches(upload, storage):
         raise HTTPException(status_code=503, detail="upload storage namespace is unavailable")
-    try:
-        await storage.delete_object(upload.temporary_object_key)
-    except StorageError as exc:
-        upload.status = "failed"
-        upload.failure_code = "cleanup_failed"
-        upload.dedupe_key = None
-        await session.commit()
-        raise HTTPException(status_code=503, detail="temporary object cleanup failed") from exc
-    upload.status = "expired"
-    upload.failure_code = "upload_expired"
-    upload.dedupe_key = None
+    expired = await session.execute(
+        update(ArtifactUploadSession)
+        .where(
+            ArtifactUploadSession.id == upload.id,
+            ArtifactUploadSession.status == "pending",
+            ArtifactUploadSession.upload_write_token.is_(None),
+            ArtifactUploadSession.finalization_token.is_(None),
+            ArtifactUploadSession.expires_at <= utc_now(),
+        )
+        .values(
+            status="expired",
+            upload_heartbeat_at=None,
+            failure_code="upload_expired",
+            dedupe_key=None,
+            finalized_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if expired.rowcount != 1:  # type: ignore[attr-defined]
+        await session.rollback()
+        return False
     await session.commit()
+    set_committed_value(upload, "status", "expired")
+    set_committed_value(upload, "upload_heartbeat_at", None)
+    set_committed_value(upload, "failure_code", "upload_expired")
+    set_committed_value(upload, "dedupe_key", None)
+    set_committed_value(upload, "finalized_at", utc_now())
+    await _cleanup_terminal_artifact_staging(
+        upload,
+        database=database,
+        storage=storage,
+        settings=settings,
+        session=session,
+    )
+    await session.refresh(upload)
+    return True
 
 
 async def _find_existing_upload(
@@ -455,6 +824,8 @@ async def initialize_artifact_upload(
     storage: StorageDep,
 ) -> ArtifactUploadInitResponse:
     response.headers["Cache-Control"] = "no-store"
+    database = cast(Database, request.app.state.database)
+    actor_worker_id = worker.id
     if payload.size_bytes > settings.artifact_max_bytes:
         raise HTTPException(status_code=413, detail="artifact exceeds configured size limit")
     if (
@@ -464,7 +835,7 @@ async def initialize_artifact_upload(
         raise HTTPException(status_code=413, detail="sample exceeds configured size limit")
     lease = await require_active_lease(
         session,
-        worker_id=worker.id,
+        worker_id=actor_worker_id,
         job_id=job_id,
         lease_id=payload.lease_id,
     )
@@ -503,7 +874,28 @@ async def initialize_artifact_upload(
                 session=session,
             )
         if existing.status == "pending" and as_utc(existing.expires_at) <= utc_now():
-            await _expire_upload(existing, storage=storage, session=session)
+            existing_id = existing.id
+            active_write_token = existing.upload_write_token
+            if active_write_token is not None:
+                await session.rollback()
+                expired = await _expire_artifact_upload_write(
+                    database,
+                    upload_id=existing_id,
+                    write_token=active_write_token,
+                )
+                existing = await session.get(ArtifactUploadSession, existing_id)
+                if existing is None:
+                    raise HTTPException(status_code=409, detail="artifact upload disappeared")
+            else:
+                expired = await _expire_upload(
+                    existing,
+                    database=database,
+                    storage=storage,
+                    settings=settings,
+                    session=session,
+                )
+            if not expired:
+                raise HTTPException(status_code=409, detail="artifact upload state changed")
         if existing.status == "expired":
             if existing.idempotency_key == payload.idempotency_key:
                 generation = existing.generation + 1
@@ -522,12 +914,6 @@ async def initialize_artifact_upload(
                 session=session,
             )
 
-    await _enforce_attempt_artifact_quota(
-        attempt_id=payload.attempt_id,
-        requested_size=payload.size_bytes,
-        settings=settings,
-        session=session,
-    )
     now = utc_now()
     upload_id = str(uuid.uuid4())
     expires_at = now + timedelta(
@@ -542,12 +928,81 @@ async def initialize_artifact_upload(
             settings,
         )
         local_token_hash = upload_token_hash(local_token)
+    temporary_object_key = staging_object_key(payload.attempt_id, upload_id)
+    verified_object_key = canonical_object_key(
+        job_id,
+        payload.attempt_id,
+        payload.artifact_type.value,
+        upload_id,
+    )
+
+    # Target generation may use a thread-backed signer. End the observational
+    # transaction before it, then revalidate the exact lease/config and reserve
+    # quota atomically. An unused presign is never returned and has no DB row.
+    await session.rollback()
+    try:
+        target = await storage.create_upload_target(
+            session_id=upload_id,
+            object_key=temporary_object_key,
+            public_api_base_url=_public_api_base_url(request, settings),
+            content_type=payload.content_type,
+            content_length=payload.size_bytes,
+            sha256=payload.sha256,
+            expires_at=expires_at,
+            local_upload_token=local_token,
+        )
+    except StorageError as exc:
+        raise HTTPException(status_code=503, detail="object upload signing failed") from exc
+
+    lease = await require_active_lease(
+        session,
+        worker_id=actor_worker_id,
+        job_id=job_id,
+        lease_id=payload.lease_id,
+    )
+    if lease.attempt_id != payload.attempt_id:
+        raise HTTPException(status_code=409, detail="upload attempt does not match lease")
+    job = await session.get(Job, job_id)
+    attempt = await session.get(JobAttempt, lease.attempt_id)
+    if job is None or attempt is None or job.current_attempt_id != attempt.id:
+        raise HTTPException(status_code=409, detail="job attempt is no longer current")
+    raced_before_reservation = await _find_existing_upload(
+        session,
+        attempt_id=payload.attempt_id,
+        idempotency_key=payload.idempotency_key,
+        dedupe_key=dedupe_key,
+    )
+    if raced_before_reservation is not None:
+        if raced_before_reservation.request_fingerprint != fingerprint:
+            raise HTTPException(status_code=409, detail="artifact upload session conflict")
+        if raced_before_reservation.status == "expired":
+            if raced_before_reservation.idempotency_key == payload.idempotency_key:
+                generation = max(generation, raced_before_reservation.generation + 1)
+            raced_before_reservation = await _find_deduplicated_upload(
+                session,
+                dedupe_key=dedupe_key,
+            )
+        if raced_before_reservation is not None:
+            return await _init_response(
+                raced_before_reservation,
+                storage=storage,
+                settings=settings,
+                request=request,
+                session=session,
+            )
+
+    await _enforce_attempt_artifact_quota(
+        attempt_id=payload.attempt_id,
+        requested_size=payload.size_bytes,
+        settings=settings,
+        session=session,
+    )
     upload = ArtifactUploadSession(
         id=upload_id,
         job_id=job_id,
         attempt_id=payload.attempt_id,
         lease_id=payload.lease_id,
-        worker_id=worker.id,
+        worker_id=actor_worker_id,
         artifact_type=payload.artifact_type.value,
         filename=payload.filename,
         content_type=payload.content_type,
@@ -558,13 +1013,8 @@ async def initialize_artifact_upload(
         generation=generation,
         request_fingerprint=fingerprint,
         dedupe_key=dedupe_key,
-        temporary_object_key=staging_object_key(payload.attempt_id, upload_id),
-        canonical_object_key=canonical_object_key(
-            job_id,
-            payload.attempt_id,
-            payload.artifact_type.value,
-            upload_id,
-        ),
+        temporary_object_key=temporary_object_key,
+        canonical_object_key=verified_object_key,
         storage_backend=storage.backend,
         storage_namespace_sha256=storage.namespace_fingerprint,
         status="pending",
@@ -593,20 +1043,6 @@ async def initialize_artifact_upload(
             request=request,
             session=session,
         )
-    try:
-        target = await storage.create_upload_target(
-            session_id=upload.id,
-            object_key=upload.temporary_object_key,
-            public_api_base_url=_public_api_base_url(request, settings),
-            content_type=upload.content_type,
-            content_length=upload.expected_size_bytes,
-            sha256=upload.expected_sha256,
-            expires_at=upload.expires_at,
-            local_upload_token=local_token,
-        )
-    except StorageError as exc:
-        await session.rollback()
-        raise HTTPException(status_code=503, detail="object upload signing failed") from exc
     await session.commit()
     return ArtifactUploadInitResponse(
         upload_session_id=upload.id,
@@ -627,11 +1063,13 @@ async def local_presigned_upload(
     upload_session_id: str,
     request: Request,
     session: SessionDep,
+    settings: SettingsDep,
     storage: StorageDep,
     upload_token: Annotated[str | None, Header(alias="X-RVC-Upload-Token")] = None,
 ) -> Response:
     if not isinstance(storage, LocalStorageAdapter):
         raise HTTPException(status_code=404, detail="upload endpoint not found")
+    database = cast(Database, request.app.state.database)
     upload = await session.get(ArtifactUploadSession, upload_session_id)
     if upload is None or upload.storage_backend != "local":
         raise HTTPException(status_code=404, detail="upload session not found")
@@ -640,8 +1078,29 @@ async def local_presigned_upload(
     if upload.status != "pending":
         raise HTTPException(status_code=409, detail="upload session is not writable")
     if as_utc(upload.expires_at) <= utc_now():
-        await _expire_upload(upload, storage=storage, session=session)
+        active_write_token = upload.upload_write_token
+        if active_write_token is not None:
+            await session.rollback()
+            expired = await _expire_artifact_upload_write(
+                database,
+                upload_id=upload_session_id,
+                write_token=active_write_token,
+            )
+        else:
+            expired = await _expire_upload(
+                upload,
+                database=database,
+                storage=storage,
+                settings=settings,
+                session=session,
+            )
+        if not expired:
+            raise HTTPException(status_code=409, detail="artifact upload state changed")
         raise HTTPException(status_code=410, detail="upload session expired")
+    if upload.uploaded_at is not None:
+        raise HTTPException(status_code=409, detail="upload session is already sealed")
+    if upload.upload_write_token is not None:
+        raise HTTPException(status_code=409, detail="upload session write is active")
     if upload_token is None or not verify_upload_token(
         upload_token,
         upload.upload_token_hash,
@@ -658,19 +1117,127 @@ async def local_presigned_upload(
         raise HTTPException(status_code=422, detail="Content-Length does not match session")
     if request.headers.get("content-type", "").lower() != upload.content_type:
         raise HTTPException(status_code=422, detail="Content-Type does not match session")
-    try:
-        await storage.write_upload_stream(
-            upload.temporary_object_key,
-            request.stream(),
-            expected_size=upload.expected_size_bytes,
+
+    expected_object_key = upload.temporary_object_key
+    expected_size_bytes = upload.expected_size_bytes
+    write_expires_at = as_utc(upload.expires_at)
+    write_token = str(uuid.uuid4())
+    claimed_at = utc_now()
+    claimed = await session.execute(
+        update(ArtifactUploadSession)
+        .where(
+            ArtifactUploadSession.id == upload_session_id,
+            ArtifactUploadSession.status == "pending",
+            ArtifactUploadSession.upload_write_token.is_(None),
+            ArtifactUploadSession.finalization_token.is_(None),
+            ArtifactUploadSession.uploaded_at.is_(None),
+            ArtifactUploadSession.expires_at > claimed_at,
         )
+        .values(
+            upload_write_token=write_token,
+            upload_heartbeat_at=claimed_at,
+            failure_code=None,
+            updated_at=claimed_at,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:  # type: ignore[attr-defined]
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="upload session write conflict")
+    await session.commit()
+
+    try:
+        remaining_seconds = max(0.0, (write_expires_at - utc_now()).total_seconds())
+        with anyio.fail_after(remaining_seconds):
+            await _run_with_artifact_upload_write_heartbeat(
+                lambda: storage.write_upload_stream(
+                    expected_object_key,
+                    request.stream(),
+                    expected_size=expected_size_bytes,
+                ),
+                database=database,
+                upload_id=upload_session_id,
+                write_token=write_token,
+                heartbeat_seconds=settings.artifact_upload_write_heartbeat_seconds,
+            )
+    except TimeoutError as exc:
+        await _expire_artifact_upload_write(
+            database,
+            upload_id=upload_session_id,
+            write_token=write_token,
+        )
+        raise HTTPException(status_code=408, detail="artifact upload deadline exceeded") from exc
+    except ArtifactUploadWriteOwnershipLost as exc:
+        expired = await _expire_artifact_upload_write(
+            database,
+            upload_id=upload_session_id,
+            write_token=write_token,
+        )
+        if not expired:
+            await _clear_artifact_upload_write(
+                database,
+                upload_id=upload_session_id,
+                write_token=write_token,
+            )
+        raise HTTPException(status_code=409, detail="upload write ownership changed") from exc
     except ObjectTooLarge as exc:
+        await _clear_artifact_upload_write(
+            database,
+            upload_id=upload_session_id,
+            write_token=write_token,
+        )
         raise HTTPException(status_code=413, detail="uploaded object exceeds session size") from exc
     except ObjectSizeMismatch as exc:
+        await _clear_artifact_upload_write(
+            database,
+            upload_id=upload_session_id,
+            write_token=write_token,
+        )
         raise HTTPException(status_code=422, detail="uploaded object size mismatch") from exc
     except StorageError as exc:
+        await _clear_artifact_upload_write(
+            database,
+            upload_id=upload_session_id,
+            write_token=write_token,
+        )
         raise HTTPException(status_code=503, detail="local object upload failed") from exc
-    upload.uploaded_at = utc_now()
+    except anyio.get_cancelled_exc_class():
+        with anyio.CancelScope(shield=True):
+            await _clear_artifact_upload_write(
+                database,
+                upload_id=upload_session_id,
+                write_token=write_token,
+            )
+        raise
+
+    sealed_at = utc_now()
+    sealed = await session.execute(
+        update(ArtifactUploadSession)
+        .where(
+            ArtifactUploadSession.id == upload_session_id,
+            ArtifactUploadSession.status == "pending",
+            ArtifactUploadSession.upload_write_token == write_token,
+            ArtifactUploadSession.finalization_token.is_(None),
+            ArtifactUploadSession.uploaded_at.is_(None),
+            ArtifactUploadSession.expires_at > sealed_at,
+        )
+        .values(
+            uploaded_at=sealed_at,
+            upload_write_token=None,
+            upload_heartbeat_at=None,
+            failure_code=None,
+            updated_at=sealed_at,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if sealed.rowcount != 1:  # type: ignore[attr-defined]
+        await session.rollback()
+        await _expire_artifact_upload_write(
+            database,
+            upload_id=upload_session_id,
+            write_token=write_token,
+        )
+        raise HTTPException(status_code=409, detail="upload write ownership changed")
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -678,20 +1245,99 @@ async def local_presigned_upload(
 async def _mark_verification_failure(
     upload: ArtifactUploadSession,
     *,
+    finalization_token: str,
     failure_code: str,
+    database: Database,
     storage: StorageAdapter,
+    settings: SettingsDep,
     session: SessionDep,
-) -> None:
+) -> bool:
     if not _upload_storage_matches(upload, storage):
         raise HTTPException(status_code=503, detail="upload storage namespace is unavailable")
-    try:
-        await storage.delete_object(upload.temporary_object_key)
-    except StorageError:
-        failure_code = "cleanup_failed"
-    upload.status = "failed"
-    upload.failure_code = failure_code
-    upload.dedupe_key = None
+    transitioned = await _transition_owned_finalizing(
+        upload,
+        finalization_token=finalization_token,
+        status="failed",
+        failure_code=failure_code,
+        session=session,
+    )
+    if not transitioned:
+        return False
+    canonical_not_required_at = utc_now()
+    await session.execute(
+        update(ArtifactUploadSession)
+        .where(
+            ArtifactUploadSession.id == upload.id,
+            ArtifactUploadSession.status == "failed",
+            ArtifactUploadSession.canonical_cleanup_completed_at.is_(None),
+        )
+        .values(
+            canonical_cleanup_completed_at=canonical_not_required_at,
+            updated_at=canonical_not_required_at,
+        )
+        .execution_options(synchronize_session=False)
+    )
     await session.commit()
+    set_committed_value(
+        upload,
+        "canonical_cleanup_completed_at",
+        canonical_not_required_at,
+    )
+    await _cleanup_terminal_artifact_staging(
+        upload,
+        database=database,
+        storage=storage,
+        settings=settings,
+        session=session,
+    )
+    return True
+
+
+async def _fail_owned_after_canonical_publish(
+    upload: ArtifactUploadSession,
+    *,
+    finalization_token: str,
+    failure_code: str,
+    database: Database,
+    storage: StorageAdapter,
+    settings: SettingsDep,
+    session: SessionDep,
+) -> bool:
+    transitioned = await _transition_owned_finalizing(
+        upload,
+        finalization_token=finalization_token,
+        status="failed",
+        failure_code=failure_code,
+        session=session,
+    )
+    if not transitioned:
+        return False
+    # Canonical cleanup is deliberately deferred. A previously recovered
+    # finalizer can still finish its external publish after losing the DB token;
+    # the API-owned reconciler waits the stale-operation window and requires a
+    # claimed first delete plus a confirmation delete.
+    await _cleanup_terminal_artifact_staging(
+        upload,
+        database=database,
+        storage=storage,
+        settings=settings,
+        session=session,
+    )
+    return True
+
+
+async def _reload_artifact_upload_for_cleanup(
+    session: SessionDep,
+    upload_id: str,
+) -> ArtifactUploadSession:
+    upload = await session.scalar(
+        select(ArtifactUploadSession)
+        .where(ArtifactUploadSession.id == upload_id)
+        .execution_options(populate_existing=True)
+    )
+    if upload is None:
+        raise HTTPException(status_code=409, detail="upload finalization ownership changed")
+    return upload
 
 
 @router.post(
@@ -702,15 +1348,19 @@ async def finalize_artifact_upload(
     job_id: str,
     upload_session_id: str,
     payload: ArtifactUploadFinalizeRequest,
+    request: Request,
     worker: WorkerDep,
     session: SessionDep,
     settings: SettingsDep,
     storage: StorageDep,
     mlflow: MlflowDep,
 ) -> ArtifactRead:
+    database = cast(Database, request.app.state.database)
+    heartbeat_seconds = max(1, min(30, settings.artifact_finalizing_stale_seconds // 3))
+    actor_worker_id = worker.id
     lease = await require_active_lease(
         session,
-        worker_id=worker.id,
+        worker_id=actor_worker_id,
         job_id=job_id,
         lease_id=payload.lease_id,
     )
@@ -720,9 +1370,15 @@ async def finalize_artifact_upload(
         job_id=job_id,
         attempt_id=payload.attempt_id,
         lease_id=payload.lease_id,
-        worker_id=worker.id,
+        worker_id=actor_worker_id,
     ):
         raise HTTPException(status_code=409, detail="upload session does not match lease")
+    owned_upload_id = upload.id
+    owned_temporary_object_key = upload.temporary_object_key
+    owned_canonical_object_key = upload.canonical_object_key
+    owned_expected_size_bytes = upload.expected_size_bytes
+    owned_expected_sha256 = upload.expected_sha256
+    owned_content_type = upload.content_type
     if not _upload_storage_matches(upload, storage):
         raise HTTPException(status_code=503, detail="upload storage namespace is unavailable")
     if upload.status == "completed" and upload.artifact_id:
@@ -740,46 +1396,98 @@ async def finalize_artifact_upload(
         )
         if not recovered:
             raise HTTPException(status_code=409, detail="upload session is already finalizing")
+    if upload.upload_write_token is not None:
+        raise HTTPException(status_code=409, detail="upload session write is active")
+    if upload.storage_backend == "local" and upload.uploaded_at is None:
+        raise HTTPException(status_code=409, detail="local upload is not sealed")
     if as_utc(upload.expires_at) <= utc_now():
-        await _expire_upload(upload, storage=storage, session=session)
+        expired = await _expire_upload(
+            upload,
+            database=database,
+            storage=storage,
+            settings=settings,
+            session=session,
+        )
+        if not expired:
+            raise HTTPException(status_code=409, detail="artifact upload state changed")
         raise HTTPException(status_code=409, detail="upload session expired")
+    finalization_token = str(uuid.uuid4())
     claimed = await session.execute(
         update(ArtifactUploadSession)
         .where(
             ArtifactUploadSession.id == upload.id,
             ArtifactUploadSession.status == "pending",
+            ArtifactUploadSession.upload_write_token.is_(None),
+            ArtifactUploadSession.finalization_token.is_(None),
+            or_(
+                ArtifactUploadSession.storage_backend != "local",
+                ArtifactUploadSession.uploaded_at.is_not(None),
+            ),
         )
-        .values(status="finalizing", updated_at=utc_now())
+        .values(
+            status="finalizing",
+            finalization_token=finalization_token,
+            failure_code=None,
+            updated_at=utc_now(),
+        )
+        .execution_options(synchronize_session=False)
     )
     if claimed.rowcount != 1:  # type: ignore[attr-defined]
         await session.rollback()
         raise HTTPException(status_code=409, detail="upload session finalization conflict")
     await session.commit()
-    upload.status = "finalizing"
+    set_committed_value(upload, "status", "finalizing")
+    set_committed_value(upload, "finalization_token", finalization_token)
+    set_committed_value(upload, "failure_code", None)
 
     spool_path: Path | None = None
-    canonical_published = False
     try:
-        spool_path = await verify_object_to_spool(
-            storage,
-            upload.temporary_object_key,
-            expected_size=upload.expected_size_bytes,
-            expected_sha256=upload.expected_sha256,
-            settings=settings,
+        spool_path = await _run_with_artifact_finalization_heartbeat(
+            lambda: verify_object_to_spool(
+                storage,
+                owned_temporary_object_key,
+                expected_size=owned_expected_size_bytes,
+                expected_sha256=owned_expected_sha256,
+                settings=settings,
+            ),
+            database=database,
+            upload_id=owned_upload_id,
+            finalization_token=finalization_token,
+            heartbeat_seconds=heartbeat_seconds,
         )
+    except ArtifactFinalizationOwnershipLost as exc:
+        if isinstance(exc.result, Path):
+            try:
+                await remove_spool_file(exc.result)
+            except ArtifactSpoolError:
+                pass
+        raise HTTPException(
+            status_code=409,
+            detail="upload finalization ownership changed",
+        ) from exc
     except ObjectNotFound as exc:
-        await _reset_finalizing_to_pending(
+        transitioned = await _reset_finalizing_to_pending(
             upload,
+            finalization_token=finalization_token,
             failure_code="uploaded_object_not_found",
             session=session,
         )
+        if not transitioned:
+            raise HTTPException(
+                status_code=409, detail="upload finalization ownership changed"
+            ) from exc
         raise HTTPException(status_code=409, detail="uploaded object not found") from exc
     except ArtifactSpoolError as exc:
-        await _reset_finalizing_to_pending(
+        transitioned = await _reset_finalizing_to_pending(
             upload,
+            finalization_token=finalization_token,
             failure_code=exc.failure_code,
             session=session,
         )
+        if not transitioned:
+            raise HTTPException(
+                status_code=409, detail="upload finalization ownership changed"
+            ) from exc
         raise HTTPException(
             status_code=503,
             detail="artifact verification spool is temporarily unavailable",
@@ -788,93 +1496,199 @@ async def finalize_artifact_upload(
         failure_code = (
             exc.failure_code if isinstance(exc, ArtifactVerificationMismatch) else "size_mismatch"
         )
-        await _mark_verification_failure(
+        transitioned = await _mark_verification_failure(
             upload,
+            finalization_token=finalization_token,
             failure_code=failure_code,
+            database=database,
             storage=storage,
+            settings=settings,
             session=session,
         )
+        if not transitioned:
+            raise HTTPException(
+                status_code=409, detail="upload finalization ownership changed"
+            ) from exc
         raise HTTPException(
             status_code=422,
             detail="uploaded artifact failed size or SHA-256 verification",
         ) from exc
     except StorageError as exc:
-        await _reset_finalizing_to_pending(
+        transitioned = await _reset_finalizing_to_pending(
             upload,
+            finalization_token=finalization_token,
             failure_code="verification_read_failed",
             session=session,
         )
+        if not transitioned:
+            raise HTTPException(
+                status_code=409, detail="upload finalization ownership changed"
+            ) from exc
         raise HTTPException(status_code=503, detail="artifact verification read failed") from exc
 
     try:
-        await session.refresh(upload)
-        if upload.status != "finalizing":
-            raise HTTPException(status_code=409, detail="upload session is no longer finalizing")
-        await session.refresh(lease)
-        if not lease.active or as_utc(lease.expires_at) <= utc_now():
-            await _mark_verification_failure(
-                upload,
-                failure_code="lease_expired",
-                storage=storage,
-                session=session,
-            )
-            raise HTTPException(status_code=409, detail="job lease expired during finalize")
-        assert spool_path is not None
-        await storage.store_verified_file(
-            upload.canonical_object_key,
-            spool_path,
-            content_type=upload.content_type,
-            sha256=upload.expected_sha256,
+        lease = await require_active_lease(
+            session,
+            worker_id=actor_worker_id,
+            job_id=job_id,
+            lease_id=payload.lease_id,
         )
-        canonical_published = True
-        await storage.delete_object(upload.temporary_object_key)
-        await session.refresh(upload)
-        if upload.status != "finalizing":
-            await storage.delete_object(upload.canonical_object_key)
-            canonical_published = False
-            raise HTTPException(status_code=409, detail="upload session is no longer finalizing")
-        await session.refresh(lease)
-        if not lease.active or as_utc(lease.expires_at) <= utc_now():
-            await storage.delete_object(upload.canonical_object_key)
-            canonical_published = False
-            upload.status = "expired"
-            upload.failure_code = "lease_expired"
-            upload.dedupe_key = None
-            await session.commit()
-            raise HTTPException(status_code=409, detail="job lease expired during finalize")
-    except HTTPException:
+        if lease.attempt_id != payload.attempt_id:
+            raise HTTPException(status_code=409, detail="upload attempt does not match lease")
+    except HTTPException as exc:
+        await session.rollback()
+        upload = await _reload_artifact_upload_for_cleanup(session, owned_upload_id)
+        spool_failure: ArtifactSpoolError | None = None
+        assert spool_path is not None
+        try:
+            await remove_spool_file(spool_path)
+        except ArtifactSpoolError as cleanup_exc:
+            spool_failure = cleanup_exc
+        failure_code = (
+            spool_failure.failure_code
+            if spool_failure is not None
+            else (
+                "job_config_integrity_failed"
+                if exc.detail == "job configuration integrity check failed"
+                else "claim_changed_after_verification"
+            )
+        )
+        transitioned = await _mark_verification_failure(
+            upload,
+            finalization_token=finalization_token,
+            failure_code=failure_code,
+            database=database,
+            storage=storage,
+            settings=settings,
+            session=session,
+        )
+        if not transitioned:
+            raise HTTPException(
+                status_code=409, detail="upload finalization ownership changed"
+            ) from exc
+        if spool_failure is not None:
+            raise HTTPException(
+                status_code=503,
+                detail="artifact verification spool cleanup failed",
+            ) from spool_failure
         raise
+
+    # The pre-publish check is observational. Do not keep its transaction open
+    # while streaming to the object store; the post-publish write fence below
+    # revalidates the complete claim before any ledger commit.
+    await session.rollback()
+    assert spool_path is not None
+    verified_spool_path = spool_path
+
+    async def publish_canonical() -> None:
+        await storage.store_verified_file(
+            owned_canonical_object_key,
+            verified_spool_path,
+            content_type=owned_content_type,
+            sha256=owned_expected_sha256,
+        )
+
+    try:
+        await _run_with_artifact_finalization_heartbeat(
+            publish_canonical,
+            database=database,
+            upload_id=owned_upload_id,
+            finalization_token=finalization_token,
+            heartbeat_seconds=heartbeat_seconds,
+        )
+    except ArtifactFinalizationOwnershipLost as exc:
+        try:
+            await remove_spool_file(verified_spool_path)
+        except ArtifactSpoolError:
+            pass
+        # A replacement token may now own the same immutable canonical key.
+        raise HTTPException(
+            status_code=409,
+            detail="upload finalization ownership changed",
+        ) from exc
     except StorageError as exc:
-        if canonical_published:
-            try:
-                await storage.delete_object(upload.canonical_object_key)
-            except StorageError:
-                pass
-        upload.status = "failed"
-        upload.failure_code = "storage_publish_failed"
-        upload.dedupe_key = None
-        await session.commit()
+        try:
+            await remove_spool_file(verified_spool_path)
+        except ArtifactSpoolError:
+            pass
+        upload = await _reload_artifact_upload_for_cleanup(session, owned_upload_id)
+        transitioned = await _fail_owned_after_canonical_publish(
+            upload,
+            finalization_token=finalization_token,
+            failure_code="storage_publish_failed",
+            database=database,
+            storage=storage,
+            settings=settings,
+            session=session,
+        )
+        if not transitioned:
+            raise HTTPException(
+                status_code=409, detail="upload finalization ownership changed"
+            ) from exc
         raise HTTPException(status_code=503, detail="verified artifact publish failed") from exc
-    finally:
-        if spool_path is not None:
-            try:
-                await remove_spool_file(spool_path)
-            except ArtifactSpoolError as exc:
-                if canonical_published:
-                    try:
-                        await storage.delete_object(upload.canonical_object_key)
-                    except StorageError:
-                        pass
-                await _mark_verification_failure(
-                    upload,
-                    failure_code=exc.failure_code,
-                    storage=storage,
-                    session=session,
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail="artifact verification spool cleanup failed",
-                ) from exc
+
+    try:
+        await remove_spool_file(verified_spool_path)
+        spool_path = None
+    except ArtifactSpoolError as exc:
+        upload = await _reload_artifact_upload_for_cleanup(session, owned_upload_id)
+        transitioned = await _fail_owned_after_canonical_publish(
+            upload,
+            finalization_token=finalization_token,
+            failure_code=exc.failure_code,
+            database=database,
+            storage=storage,
+            settings=settings,
+            session=session,
+        )
+        if not transitioned:
+            raise HTTPException(
+                status_code=409, detail="upload finalization ownership changed"
+            ) from exc
+        raise HTTPException(
+            status_code=503,
+            detail="artifact verification spool cleanup failed",
+        ) from exc
+
+    try:
+        lease = await require_active_lease(
+            session,
+            worker_id=actor_worker_id,
+            job_id=job_id,
+            lease_id=payload.lease_id,
+            for_update=True,
+        )
+        if lease.attempt_id != payload.attempt_id:
+            raise HTTPException(status_code=409, detail="upload attempt does not match lease")
+        upload = await _reload_artifact_upload_for_cleanup(session, owned_upload_id)
+        if (
+            upload.status != "finalizing"
+            or upload.finalization_token != finalization_token
+        ):
+            raise HTTPException(status_code=409, detail="upload finalization ownership changed")
+    except HTTPException as exc:
+        # Release Lease -> Job -> Attempt locks before any object-store cleanup.
+        await session.rollback()
+        upload = await _reload_artifact_upload_for_cleanup(session, owned_upload_id)
+        claim_failure_code = (
+            "job_config_integrity_failed"
+            if exc.detail == "job configuration integrity check failed"
+            else "claim_changed_after_verification"
+        )
+        transitioned = await _fail_owned_after_canonical_publish(
+            upload,
+            finalization_token=finalization_token,
+            failure_code=claim_failure_code,
+            database=database,
+            storage=storage,
+            settings=settings,
+            session=session,
+        )
+        if not transitioned:
+            raise HTTPException(
+                status_code=409, detail="upload finalization ownership changed"
+            ) from exc
+        raise
 
     manager_metadata = dict(upload.metadata_json)
     manager_metadata["manager_verification"] = {
@@ -911,47 +1725,101 @@ async def finalize_artifact_upload(
             .where(
                 ArtifactUploadSession.id == upload.id,
                 ArtifactUploadSession.status == "finalizing",
+                ArtifactUploadSession.finalization_token == finalization_token,
             )
             .values(
                 artifact_id=artifact.id,
                 status="completed",
+                upload_write_token=None,
+                upload_heartbeat_at=None,
+                finalization_token=None,
                 failure_code=None,
                 uploaded_at=upload.uploaded_at or now,
                 finalized_at=now,
                 updated_at=now,
             )
+            .execution_options(synchronize_session=False)
         )
         if completed.rowcount != 1:  # type: ignore[attr-defined]
             await session.rollback()
-            try:
-                await storage.delete_object(upload.canonical_object_key)
-            except StorageError:
-                pass
-            raise HTTPException(status_code=409, detail="upload finalization lost ownership")
+            raise ArtifactFinalizationOwnershipLost
         await session.commit()
-    except HTTPException:
+        set_committed_value(upload, "artifact_id", artifact.id)
+        set_committed_value(upload, "status", "completed")
+        set_committed_value(upload, "upload_write_token", None)
+        set_committed_value(upload, "upload_heartbeat_at", None)
+        set_committed_value(upload, "finalization_token", None)
+        set_committed_value(upload, "failure_code", None)
+        set_committed_value(upload, "finalized_at", now)
+    except ArtifactFinalizationOwnershipLost as exc:
+        # Another token may now own the same immutable canonical key.
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="upload finalization lost ownership") from exc
+    except InvalidJobConfigLedger as exc:
+        await session.rollback()
+        upload = await _reload_artifact_upload_for_cleanup(session, owned_upload_id)
+        transitioned = await _fail_owned_after_canonical_publish(
+            upload,
+            finalization_token=finalization_token,
+            failure_code="job_config_integrity_failed",
+            database=database,
+            storage=storage,
+            settings=settings,
+            session=session,
+        )
+        if not transitioned:
+            raise HTTPException(
+                status_code=409, detail="upload finalization ownership changed"
+            ) from exc
+        raise HTTPException(
+            status_code=409,
+            detail="job configuration integrity check failed",
+        ) from exc
+    except HTTPException as exc:
+        await session.rollback()
+        upload = await _reload_artifact_upload_for_cleanup(session, owned_upload_id)
+        transitioned = await _fail_owned_after_canonical_publish(
+            upload,
+            finalization_token=finalization_token,
+            failure_code="artifact_commit_conflict",
+            database=database,
+            storage=storage,
+            settings=settings,
+            session=session,
+        )
+        if not transitioned:
+            raise HTTPException(
+                status_code=409, detail="upload finalization ownership changed"
+            ) from exc
         raise
     except IntegrityError as exc:
         await session.rollback()
-        try:
-            await storage.delete_object(upload.canonical_object_key)
-        except StorageError:
-            pass
-        await session.execute(
-            update(ArtifactUploadSession)
-            .where(
-                ArtifactUploadSession.id == upload.id,
-                ArtifactUploadSession.status == "finalizing",
-            )
-            .values(
-                status="failed",
-                failure_code="artifact_commit_conflict",
-                dedupe_key=None,
-                updated_at=utc_now(),
-            )
+        upload = await _reload_artifact_upload_for_cleanup(session, owned_upload_id)
+        transitioned = await _fail_owned_after_canonical_publish(
+            upload,
+            finalization_token=finalization_token,
+            failure_code="artifact_commit_conflict",
+            database=database,
+            storage=storage,
+            settings=settings,
+            session=session,
         )
-        await session.commit()
+        if not transitioned:
+            raise HTTPException(
+                status_code=409, detail="upload finalization ownership changed"
+            ) from exc
         raise HTTPException(status_code=409, detail="canonical artifact already exists") from exc
+
+    # Local upload credentials are revoked by the completed DB state and can be
+    # cleaned immediately. S3 staging remains as the If-None-Match seal until
+    # the signed PUT URL and its configured grace have elapsed.
+    await _cleanup_terminal_artifact_staging(
+        upload,
+        database=database,
+        storage=storage,
+        settings=settings,
+        session=session,
+    )
     await session.refresh(artifact)
     await mlflow.sync_after_commit(mlflow_event_key)
     return artifact_to_read(artifact)
@@ -1120,16 +1988,16 @@ async def _lock_current_sample_claim(
     )
     now = utc_now()
     terminal_values = {item.value for item in TERMINAL_JOB_STATUSES}
+    if job is None or attempt is None:
+        raise HTTPException(status_code=409, detail="sample claim changed during verification")
     try:
-        locked_config = JobConfig.model_validate(job.config_json if job is not None else {})
-    except ValidationError as exc:
+        locked_config = validated_job_config(job, attempt=attempt)
+    except InvalidJobConfigLedger as exc:
         raise HTTPException(
             status_code=409, detail="Job snapshot changed during verification"
         ) from exc
     if (
         lease is None
-        or job is None
-        or attempt is None
         or worker is None
         or not lease.active
         or lease.released_at is not None
@@ -1289,7 +2157,13 @@ async def register_sample(
     ):
         raise HTTPException(status_code=409, detail="job attempt is no longer current")
     try:
-        config = JobConfig.model_validate(job.config_json)
+        config = validated_job_config(job, attempt=attempt)
+    except InvalidJobConfigLedger as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="job configuration integrity check failed",
+        ) from exc
+    try:
         capabilities = WorkerCapabilities.model_validate(worker.capabilities_json)
     except ValidationError as exc:
         raise HTTPException(status_code=409, detail="runtime snapshot is invalid") from exc
@@ -1517,6 +2391,41 @@ async def register_sample(
         runtime_image_digest=payload.runtime_image_digest,
         runtime_asset_manifest_sha256=payload.runtime_asset_manifest_sha256,
     )
+    try:
+        await acquire_sample_registration_job_fence(
+            session,
+            job_id=job_id,
+            attempt_id=payload.attempt_id,
+            worker_id=actor_worker_id,
+            test_set_id=payload.test_set_id,
+            sample_plan_sha256=payload.sample_plan_sha256,
+            expected_config=config,
+            runtime_image_digest=payload.runtime_image_digest,
+            runtime_asset_manifest_sha256=payload.runtime_asset_manifest_sha256,
+        )
+    except SampleRegistrationFenceConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="sample claim changed during verification",
+        ) from exc
+    except SampleRegistrationFenceUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="sample registration fence is temporarily unavailable",
+            headers={"Retry-After": "1"},
+        ) from exc
+    fenced_lease = await _lock_current_sample_claim(
+        session,
+        job_id=job_id,
+        attempt_id=payload.attempt_id,
+        lease_id=payload.lease_id,
+        worker_id=actor_worker_id,
+        test_set_id=payload.test_set_id,
+        sample_plan_sha256=payload.sample_plan_sha256,
+        expected_config=config,
+        runtime_image_digest=payload.runtime_image_digest,
+        runtime_asset_manifest_sha256=payload.runtime_asset_manifest_sha256,
+    )
 
     existing = await session.scalar(
         select(Sample).where(
@@ -1602,6 +2511,41 @@ async def register_sample(
             raise HTTPException(status_code=409, detail="sample registration conflict") from exc
         # The rollback released the row locks. Re-acquire the complete claim fence
         # before treating an insert race as an idempotent success.
+        fenced_lease = await _lock_current_sample_claim(
+            session,
+            job_id=job_id,
+            attempt_id=payload.attempt_id,
+            lease_id=payload.lease_id,
+            worker_id=actor_worker_id,
+            test_set_id=payload.test_set_id,
+            sample_plan_sha256=payload.sample_plan_sha256,
+            expected_config=config,
+            runtime_image_digest=payload.runtime_image_digest,
+            runtime_asset_manifest_sha256=payload.runtime_asset_manifest_sha256,
+        )
+        try:
+            await acquire_sample_registration_job_fence(
+                session,
+                job_id=job_id,
+                attempt_id=payload.attempt_id,
+                worker_id=actor_worker_id,
+                test_set_id=payload.test_set_id,
+                sample_plan_sha256=payload.sample_plan_sha256,
+                expected_config=config,
+                runtime_image_digest=payload.runtime_image_digest,
+                runtime_asset_manifest_sha256=payload.runtime_asset_manifest_sha256,
+            )
+        except SampleRegistrationFenceConflict as fence_exc:
+            raise HTTPException(
+                status_code=409,
+                detail="sample claim changed during verification",
+            ) from fence_exc
+        except SampleRegistrationFenceUnavailable as fence_exc:
+            raise HTTPException(
+                status_code=503,
+                detail="sample registration fence is temporarily unavailable",
+                headers={"Retry-After": "1"},
+            ) from fence_exc
         fenced_lease = await _lock_current_sample_claim(
             session,
             job_id=job_id,

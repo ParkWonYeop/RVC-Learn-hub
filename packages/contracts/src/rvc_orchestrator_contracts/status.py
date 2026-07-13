@@ -31,7 +31,7 @@ TERMINAL_JOB_STATUSES = frozenset({JobStatus.COMPLETED, JobStatus.FAILED, JobSta
 
 _failure_or_cancel = {JobStatus.FAILED, JobStatus.CANCELLED}
 _transitions: dict[JobStatus, frozenset[JobStatus]] = {
-    JobStatus.QUEUED: frozenset({JobStatus.ASSIGNED, JobStatus.CANCELLED}),
+    JobStatus.QUEUED: frozenset({JobStatus.ASSIGNED, JobStatus.FAILED, JobStatus.CANCELLED}),
     JobStatus.ASSIGNED: frozenset({JobStatus.DOWNLOADING_DATASET, *_failure_or_cancel}),
     JobStatus.DOWNLOADING_DATASET: frozenset({JobStatus.VALIDATING_DATASET, *_failure_or_cancel}),
     JobStatus.VALIDATING_DATASET: frozenset(
