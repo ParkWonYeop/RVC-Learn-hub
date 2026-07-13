@@ -37,6 +37,10 @@
 - Buildx/표준 Docker build 두 경로와 deployment contract의 집중 회귀도 PASS했고
   `bash -n installers/manager/build-self-contained-release.sh`를 통과했다. 실제 Docker 29 client에서
   Buildx 명령은 부재하지만 `docker build --help`의 `--platform` 지원을 확인했다.
+- 이후 arm64 Docker daemon에서 실제 dev.20 build를 실행하자 legacy builder가 amd64 base의 첫
+  intermediate image 뒤 `does not provide the specified platform (linux/amd64)`로 중단됐다. Archive는
+  게시되지 않았다. 이에 표준 Docker fallback은 daemon architecture가 `amd64|x86_64`일 때만
+  허용하고, 다른 host에서는 Buildx 없이는 build/pull/bundle 전에 fail-closed하도록 보정했다.
 - 이 변경은 source preflight 한 단계만 복구한다. 실제 linux/amd64 8-image Manager archive 생성,
   dependency image의 비어 있는 `Config.User` inspect 처리, clean Ubuntu 설치와 Worker CUDA/RVC
   runtime qualification은 별도 release gate로 남는다.

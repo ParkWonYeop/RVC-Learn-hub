@@ -105,6 +105,9 @@ with open(os.environ["FAKE_DOCKER_LOG"], "a", encoding="utf-8") as stream:
 
 if args[:2] == ["buildx", "version"]:
     raise SystemExit(0 if os.environ.get("FAKE_BUILDX_MISSING") != "1" else 2)
+if args[:2] == ["info", "--format"]:
+    print(os.environ.get("FAKE_DOCKER_ARCHITECTURE", "amd64"))
+    raise SystemExit(0)
 if args[:2] == ["buildx", "build"]:
     tag = args[args.index("--tag") + 1]
     if os.environ.get("FAKE_BUILD_FAIL_REFERENCE") == tag:
@@ -266,7 +269,7 @@ def test_release_builder_falls_back_to_platform_docker_build_without_buildx(
         FAKE_BUILDX_MISSING="1",
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "using docker build with final platform verification" in result.stderr
+    assert "using same-architecture docker build with final platform verification" in result.stderr
 
     docker_commands = [
         json.loads(line) for line in docker_log.read_text(encoding="utf-8").splitlines()
@@ -282,6 +285,24 @@ def test_release_builder_falls_back_to_platform_docker_build_without_buildx(
         assert f"RVC_SOURCE_COMMIT={COMMIT}" in command
     assert bundle_args.is_file()
     assert (output / f"rvc-manager-{VERSION}-linux-amd64.tar.gz").is_file()
+
+
+def test_release_builder_requires_buildx_for_cross_architecture_build(
+    tmp_path: Path,
+) -> None:
+    result, output, docker_log, bundle_args = _run(
+        tmp_path,
+        FAKE_BUILDX_MISSING="1",
+        FAKE_DOCKER_ARCHITECTURE="aarch64",
+    )
+    assert result.returncode != 0
+    assert "Docker Buildx is required to cross-build linux/amd64 images from aarch64" in result.stderr
+    commands = [
+        json.loads(line) for line in docker_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert not any(command[:1] in (["build"], ["pull"]) for command in commands)
+    assert not bundle_args.exists()
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(

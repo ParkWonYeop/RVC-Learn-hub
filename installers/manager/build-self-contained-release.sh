@@ -43,7 +43,18 @@ build_backend=docker
 if docker buildx version >/dev/null 2>&1; then
   build_backend=buildx
 else
-  rvc_warn "Docker Buildx is unavailable; using docker build with final platform verification"
+  docker_architecture=$(docker info --format '{{.Architecture}}') || \
+    rvc_die "Docker daemon architecture could not be inspected"
+  [[ $docker_architecture != *$'\n'* && $docker_architecture != *$'\r'* ]] || \
+    rvc_die "Docker daemon architecture inspection returned multiple values"
+  case "$docker_architecture" in
+    amd64|x86_64)
+      rvc_warn "Docker Buildx is unavailable; using same-architecture docker build with final platform verification"
+      ;;
+    *)
+      rvc_die "Docker Buildx is required to cross-build linux/amd64 images from $docker_architecture"
+      ;;
+  esac
 fi
 
 archive="$output_dir/rvc-manager-$version-linux-amd64.tar.gz"
