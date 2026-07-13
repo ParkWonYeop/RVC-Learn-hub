@@ -4,6 +4,39 @@
 
 ## 2026-07-13
 
+### GitHub 게시 전 repository ignore 정책 보강
+
+**목적과 변경 범위**
+
+- GitHub 원격 저장소 연결 전에 로컬 개발 환경과 실제 RVC 학습 자료가 실수로 추적되는 것을
+  막도록 root `.gitignore`를 프로젝트 구조에 맞게 보강했다. macOS/Windows/editor 파일,
+  Python·Node/Next.js cache와 virtual environment, coverage/build 산출물, local DB/log/process
+  상태를 명시적으로 제외한다.
+- Manager/Worker의 local `data`, Dataset, Artifact, workspace, log, weight, checkpoint, telemetry
+  spool, MLflow/W&B 및 `var` object-storage 경로를 repository root 기준으로 제외했다. 실제 model,
+  index/feature, 사용자 audio와 생성 archive 확장자도 기본 제외하며, 검토된 source/test fixture가
+  필요할 때만 좁은 negation rule을 추가하도록 주석으로 경계를 남겼다.
+- `.env` 변형과 private-key container는 제외하지만 `.env.example` 및 환경별 `.env.*.example`은
+  source로 허용한다. Certificate-only 공개 test fixture인 `tests/fixtures/custom-ca.pem`은 private
+  key와 구분해 계속 추적 가능하게 유지했다. `docs/REQUIREMENTS_TRACEABILITY.md`의 `DEP-006`에
+  repository ignore/source-closure 검증 경계를 연결했으며, 제품 기능이나 release 완료 상태는
+  변경하지 않았다.
+
+**검증과 남은 범위**
+
+- `python3 tools/verify_release_source.py --repo-root .`은
+  `Release source ignore closure verified (409 files)`로 PASS했다.
+- `git check-ignore -v --no-index`로 `.env.local`, Dataset archive, model/weight, training log,
+  local object-storage DB, Next.js cache와 `node_modules`가 각각 의도한 rule에 걸리는 것을 확인했다.
+  같은 검사에서 `.env.example`, `tests/fixtures/custom-ca.pem`, `README.md`는 ignore되지 않았다.
+- `git diff --check`가 PASS했고, 변경 전 tracked tree의 최대 파일은 약 251 KiB이며 filename audit에서
+  실제 Dataset/model/archive/private-key 파일은 발견되지 않았다. Test CA와 secret/token 기능명이
+  들어간 source/test 파일은 의도된 코드다.
+- `.gitignore`는 이미 추적된 파일을 제거하거나 파일 내용 속 credential을 탐지하지 않는다.
+  원격 push 전에는 staged diff와 tracked secret scan을 별도 확인해야 하며, 검토된 binary fixture나
+  release archive를 향후 source로 추가할 때는 blanket rule을 지우지 말고 exact path 예외와
+  provenance 검증을 함께 추가해야 한다.
+
 ### dev.20 준비 — committed source에서 TypeScript cache를 release 입력과 분리
 
 **목적과 변경 범위**
