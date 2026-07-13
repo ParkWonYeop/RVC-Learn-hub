@@ -125,6 +125,9 @@ clean tree여야 한다. Arm64 release host의 Buildx 경로는 `docker pull --p
 Dependency image에 `Config.User` key가 없으면 빈 값으로 정규화하고, OCI index `.Id`와
 Docker-save config byte digest는 각각 manifest에 기록한다. 두 digest가 다르다는 이유로 거부하지
 않지만 archive config byte와 load 전후 OCI identity 검증을 모두 통과해야 한다.
+Single-platform Docker-save closure에는 Buildx default provenance attestation을 포함하지 않도록
+`--provenance=false`로 export한다. 이는 source commit label, bundle manifest, 외부 SBOM·scan과
+release review를 대체하는 attestation이 아니며 해당 공급망 gate는 계속 별도로 남는다.
 
 Worker의 검증된 real-RVC image는 일반 `--include-image`와 구분한다. image tag는
 installer가 선택하는 `rvc-orchestrator-worker:<version>`과 같아야 하고, 원본 asset

@@ -86,6 +86,12 @@
 - 위 보정 후 Ruff, common image verifier mypy, Manager self-contained/image closure/deployment 집중
   Pytest, shell syntax와 whitespace 검사를 통과했다. Fake Docker도 dependency user key 부재와
   image ID/config digest 분리를 기본 fixture로 사용해 회귀를 막는다.
+- 세 번째 실제 build는 8개 amd64 image 생성 뒤 Docker 29 `docker save`의 OCI
+  index/attestation descriptor blob을 기존 strict verifier가 unused config로 거부해 archive 게시 전
+  중단됐다. Single-platform installer에는 default Buildx provenance를 넣지 않도록 application과
+  dependency build 모두 `--provenance=false`로 고정했다. Verifier는 Docker-save config뿐 아니라
+  manifest에 기록된 image identity descriptor의 존재와 content digest를 exact inventory로 검증한다.
+  외부 provenance/SBOM/scan gate는 닫힌 상태로 유지한다.
 - 이 변경은 source preflight 한 단계만 복구한다. 실제 linux/amd64 8-image Manager archive 생성,
   dependency image의 비어 있는 `Config.User` inspect 처리, clean Ubuntu 설치와 Worker CUDA/RVC
   runtime qualification은 별도 release gate로 남는다.

@@ -76,7 +76,7 @@ build_application_image() {
   shift 2
   local -a command=(docker)
   if [[ $build_backend == buildx ]]; then
-    command+=(buildx build --load)
+    command+=(buildx build --load --provenance=false)
   else
     command+=(build)
   fi
@@ -114,6 +114,7 @@ for reference in "${dependency_images[@]}"; do
       --platform linux/amd64 \
       --pull \
       --load \
+      --provenance=false \
       --file "$SCRIPT_DIR/dependency-image.Dockerfile" \
       --tag "$reference" \
       --build-arg "RVC_DEPENDENCY_IMAGE=$reference" \

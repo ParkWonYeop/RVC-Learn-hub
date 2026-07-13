@@ -326,6 +326,9 @@
   image의 `Config.User` key가 없으면 빈 값으로 정규화하되 application user 검증은 완화하지 않는다.
   Containerd image store의 OCI index `.Id`와 Docker-save config byte digest는 정상적으로 다를 수
   있으므로 둘을 각각 기록·검증하고 단순 equality를 강제하지 않는다.
+  Single-platform installer image는 Buildx default provenance attestation을 image 안에 섞지 않고
+  `--provenance=false`로 export하며, Docker-save에는 exact runtime identity descriptor/config/layer
+  closure만 허용한다. 외부 SBOM·scan·source provenance gate를 이 설정으로 대체하지 않는다.
   Cross-architecture Buildx release는 dependency source tag도 target platform의 zero-layer image로
   materialize한 뒤 실제 architecture를 검사한다. `docker pull --platform` 출력만으로 target tag의
   local platform을 증명하지 않는다. Manager dependency image는 rollback tag overwrite를 막는

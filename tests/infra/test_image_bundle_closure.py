@@ -186,6 +186,9 @@ if args and args[0] == "save":
         if meta["id"] != "sha256:" + digest:
             raise SystemExit(2)
         configs[digest + ".json"] = config
+        descriptor = ("oci-index:" + meta["id"]).encode()
+        descriptor_digest = hashlib.sha256(descriptor).hexdigest()
+        configs["blobs/sha256/" + descriptor_digest] = descriptor
         manifest.append(
             {"Config": digest + ".json", "RepoTags": [reference], "Layers": []}
         )

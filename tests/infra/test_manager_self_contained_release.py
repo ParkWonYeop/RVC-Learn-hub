@@ -243,6 +243,7 @@ def test_release_builder_builds_and_pulls_exact_amd64_closure(tmp_path: Path) ->
         assert command[command.index("--platform") + 1] == "linux/amd64"
         assert "--pull" in command
         assert "--load" in command
+        assert "--provenance=false" in command
         assert command[command.index("--tag") + 1] == SOURCE_IMAGES[role]
         assert command[command.index("--file") + 1].endswith(dockerfile)
         assert f"RVC_RELEASE_VERSION={VERSION}" in command
@@ -257,6 +258,7 @@ def test_release_builder_builds_and_pulls_exact_amd64_closure(tmp_path: Path) ->
         assert command[command.index("--platform") + 1] == "linux/amd64"
         assert "--pull" in command
         assert "--load" in command
+        assert "--provenance=false" in command
         assert command[command.index("--tag") + 1] == SOURCE_IMAGES[role]
         assert f"RVC_DEPENDENCY_IMAGE={SOURCE_IMAGES[role]}" in command
 

@@ -581,8 +581,27 @@ def _verify_docker_save_archive(
     config_like_members = {
         name for name in regular_members if CONFIG_PATH_RE.fullmatch(name) is not None
     } - layer_members
-    if config_like_members != actual_configs:
-        _fail(f"Docker image archive Config inventory differs: {path.name}")
+    if expected_images is not None:
+        expected_identity_members: set[str] = set()
+        for item in expected_images:
+            digest = item["image_id"].removeprefix("sha256:")
+            candidates = {
+                f"blobs/sha256/{digest}",
+                f"{digest}.json",
+            } & regular_members
+            if not candidates:
+                _fail(f"Docker image archive identity descriptor is missing: {path.name}")
+            expected_identity_members.update(candidates)
+        expected_metadata_members = actual_configs | expected_identity_members
+        if config_like_members != expected_metadata_members:
+            _fail(f"Docker image archive Config/identity inventory differs: {path.name}")
+        for member_name in expected_identity_members - actual_configs:
+            match = CONFIG_PATH_RE.fullmatch(member_name)
+            if match is None:
+                _fail(f"Docker image archive identity descriptor is unsafe: {path.name}")
+            raw = _read_docker_config_member(path, member_name)
+            if hashlib.sha256(raw).hexdigest() != match.group(1):
+                _fail(f"Docker image archive identity descriptor digest differs: {path.name}")
     return config_digests_by_reference
 
 

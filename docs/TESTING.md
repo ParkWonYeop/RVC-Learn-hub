@@ -392,7 +392,8 @@ SBOM·vulnerability/container/secret/SAST/license/clean-host review evidence를 
 
 Committed clean source에서 exact 8-role Manager self-contained build orchestration이 source/build backend,
 Buildx dependency materialization, linux-amd64, OCI image ID와 Docker-save config digest 분리,
-optional dependency user/application user/release-label gate를 적용하는지는 다음 fixture로 검증한다.
+optional dependency user/application user/release-label과 no-default-attestation exact archive gate를
+적용하는지는 다음 fixture로 검증한다.
 
 ```bash
 .venv/bin/pytest -q tests/infra/test_manager_self_contained_release.py
