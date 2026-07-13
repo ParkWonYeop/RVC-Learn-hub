@@ -16,6 +16,7 @@ venv/
 *.egg-info/
 node_modules/
 .next/
+*.tsbuildinfo
 coverage/
 *.log
 *.sqlite3

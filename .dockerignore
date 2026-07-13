@@ -12,6 +12,7 @@
 **/.venv
 **/node_modules
 **/.next
+**/*.tsbuildinfo
 **/coverage
 **/dist
 **/build

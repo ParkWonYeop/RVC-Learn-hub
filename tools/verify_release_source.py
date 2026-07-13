@@ -43,6 +43,7 @@ TRANSIENT_DIRECTORIES = {
     "node_modules",
     "venv",
 }
+TRANSIENT_FILE_SUFFIXES = (".tsbuildinfo",)
 
 
 class SourceClosureError(RuntimeError):
@@ -92,6 +93,8 @@ def _candidate_paths(repo_root: Path) -> list[str]:
                     raise SourceClosureError(
                         f"release source contains a non-regular file: {child_relative}"
                     )
+                if filename.endswith(TRANSIENT_FILE_SUFFIXES):
+                    continue
                 candidates.append(child_relative)
     return sorted(set(candidates))
 

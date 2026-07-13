@@ -67,7 +67,11 @@ def test_release_source_verifier_rejects_ignored_application_source(
     route.write_text("export const GET = () => null;\n", encoding="utf-8")
     (repo / "apps/web/node_modules/dependency").mkdir(parents=True)
     (repo / "apps/web/node_modules/dependency/cache.js").write_text("generated\n", encoding="utf-8")
-    (repo / ".gitignore").write_text("artifacts/\nnode_modules/\n", encoding="utf-8")
+    (repo / "apps/web/tsconfig.tsbuildinfo").write_text("{}\n", encoding="utf-8")
+    (repo / ".gitignore").write_text(
+        "artifacts/\nnode_modules/\n*.tsbuildinfo\n",
+        encoding="utf-8",
+    )
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
 
     rejected = subprocess.run(
@@ -92,7 +96,10 @@ def test_release_source_verifier_rejects_ignored_application_source(
     assert tracked_but_ignored.returncode != 0
     assert "apps/web/src/app/bff/artifacts/item/route.ts" in tracked_but_ignored.stderr
 
-    (repo / ".gitignore").write_text("/artifacts/\nnode_modules/\n", encoding="utf-8")
+    (repo / ".gitignore").write_text(
+        "/artifacts/\nnode_modules/\n*.tsbuildinfo\n",
+        encoding="utf-8",
+    )
     accepted = subprocess.run(
         ["python3", str(SOURCE_VERIFIER), "--repo-root", str(repo)],
         check=False,

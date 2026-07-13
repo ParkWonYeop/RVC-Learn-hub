@@ -4,6 +4,36 @@
 
 ## 2026-07-13
 
+### dev.20 준비 — committed source에서 TypeScript cache를 release 입력과 분리
+
+**목적과 변경 범위**
+
+- 복원된 `reconstructed/main`의 clean commit `a9b3f2bebb07d2d83e19c6928c269a56a66b0a90`과
+  409개 tracked file을 기준으로 self-contained Manager release preflight를 다시 실행했다.
+  정상적인 Next.js/TypeScript 검사 뒤 생성되는 `apps/web/tsconfig.tsbuildinfo`가 로컬
+  `.git/info/exclude`에만 있어 source closure 검증이 중단되는 문제를 재현했다.
+- `.gitignore`와 `.dockerignore`에 `*.tsbuildinfo`를 명시하고
+  `tools/verify_release_source.py`가 regular non-symlink 여부를 먼저 검사한 뒤 이 생성 cache만
+  release source 후보에서 제외하도록 했다. 실제 application source가 ignore rule에 가려지면
+  실패하는 기존 closed-world 검사는 유지한다.
+- Partial bundle 회귀가 repository에 commit이 생긴 뒤에도 `--source-commit uncommitted`를
+  고정해 실패하던 fixture를 bundle의 실제 `manifest.env` provenance로 검증하도록 수정했다.
+  이는 product verifier를 완화하지 않고, partial bundle도 이용 가능한 exact Git commit을
+  기록하는 현재 builder 계약을 테스트가 따르게 한 변경이다.
+
+**검증과 남은 범위**
+
+- `python3 tools/verify_release_source.py --repo-root .`은 생성된 `tsconfig.tsbuildinfo`가 존재하는
+  상태에서 `Release source ignore closure verified (409 files)`로 PASS했다.
+- source closure, Manager self-contained orchestrator, image closure와 installer activation 집중
+  Pytest를 통과했고 `git diff --check`도 PASS했다. 첫 시도는 존재하지 않는 과거 파일명
+  `tests/infra/test_image_bundle.py` 때문에 collection 단계에서 종료됐으며, 실제
+  `test_image_bundle_closure.py`로 바로잡은 첫 실행에서는 위 `uncommitted` fixture 불일치를
+  발견해 수정 후 재실행했다.
+- 이 변경은 source preflight 한 단계만 복구한다. 실제 linux/amd64 8-image Manager archive 생성,
+  dependency image의 비어 있는 `Config.User` inspect 처리, clean Ubuntu 설치와 Worker CUDA/RVC
+  runtime qualification은 별도 release gate로 남는다.
+
 ### dev.19 maintenance PostgreSQL·Redis·S3 최소권한과 partial 설치 번들
 
 **목적과 변경 범위**

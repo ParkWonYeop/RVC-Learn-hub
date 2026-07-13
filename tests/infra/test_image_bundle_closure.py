@@ -333,6 +333,11 @@ def _build_partial_bundle(tmp_path: Path, component: str) -> Path:
 def _verify_release_environment(
     root: Path, component: str, environment: Path
 ) -> subprocess.CompletedProcess[str]:
+    release_manifest = {
+        line.split("=", 1)[0]: line.split("=", 1)[1]
+        for line in (root / "manifest.env").read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    }
     return subprocess.run(
         [
             "python3",
@@ -345,7 +350,7 @@ def _verify_release_environment(
             "--version",
             VERSION,
             "--source-commit",
-            "uncommitted",
+            release_manifest["GIT_COMMIT"],
             "--environment",
             str(environment),
         ],
