@@ -60,6 +60,11 @@
   post-build builder 실패/tag swap 회귀 2건까지 추가한 뒤 재실행해 Python `821 passed, 4 deselected`,
   Ruff PASS, mypy `89 source files`, Web `24 files/211 tests`, ESLint, Next.js production build, 전체
   shell syntax와 `git diff --check`를 모두 통과했다.
+- 커밋 뒤 `make test-e2e`의 첫 실행은 desktop sandbox가 `127.0.0.1` ephemeral port bind를
+  `PermissionError`로 차단해 4건 모두 환경 실패했다. 동일 명령을 localhost bind 권한으로 다시
+  실행해 Manager API와 실제 WorkerAgent process 사이의 opt-in 거부, live telemetry, 전체 protocol,
+  세 Worker 동시 claim/completion HTTP E2E가 `4 passed in 8.61s`로 통과했다. 이는 Fake runner 기능
+  증거이며 NVIDIA/RVC runtime 합격 증거로 사용하지 않는다.
 
 **남은 위험**
 
