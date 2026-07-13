@@ -394,34 +394,40 @@ make test-e2e
 있다. 사용자 실행 순서와 증적·합격 기준은 `docs/TEST_GUIDE.md`, 자동화의 상세 범위는
 `docs/TESTING.md`를 본다. Fake fixture 결과를 production/native GPU 검증으로 확대 해석하지 않는다.
 
-### 현재 dev.18 기준선
+### 현재 dev.20 기준선
 
-- Manager schema head는 `e4c7b9d2f610`이다. Manager archive SHA-256은
-  `83de04e5d8e5fb5a4fecb041fec2e6a6aa08a14aa04622f5a36a1b3ba6e484b7`, 최종 Worker archive
-  SHA-256은 `6e631c9f49dd62f06d9132f55ee728364eef0d08894059cd67fc3b2f6b63b1a8`다.
-- 두 archive는 strict 외부/내부 checksum과 exact inventory 검증을 통과했지만
-  `GIT_COMMIT=uncommitted`, `SELF_CONTAINED=false`, 빈 image inventory인 partial 개발 번들이다.
-- dev.18 source의 최종 `make check`는 Python non-E2E `735 passed, 4 deselected`, strict mypy
-  `87 source files`, Web `24 files/211 tests`, lint/build를 통과했다. Model registry와 migration
-  집중 회귀는 `33 passed`, 전체 API suite는 `271 passed`였다. 현재 checkout은 tracked file이
-  0개이므로 마지막
-  `git diff --check`는 유효한 whitespace/Git provenance 증거가 아니다.
-- dev.18 installer는 archive의 `SHA256SUMS` 누락을 실제 Git source root가 아닌 곳에서 거부하고,
+- Manager schema head는 `f5d1c8a9b240`이다. Manager archive SHA-256은
+  `c6488dad47c7f38c082ed6fa68f1fe3691c069110aef0bbf68a9d7ba5e6f5b70`, 크기는
+  `667617422` byte다. Worker archive SHA-256은
+  `7f36cbf27100bf70425c2780142d4fa3f6e6e76d0acf410d3e3fb698aa50558b`, 크기는
+  `108488` byte다. 두 manifest 모두 tracked source commit
+  `298ee1ec112cc7dc3a55d8374bba8c9e38f9f55a`에 결박돼 있다.
+- Manager는 `SELF_CONTAINED=true`이고 정확히 8개의 linux/amd64 image를 포함한다. 외부 checksum,
+  내부 exact ledger, image/archive closure, load 뒤 identity와 release image를 사용한 전체 Compose
+  smoke가 모두 PASS했다. 이 runtime 증거는 arm64 Colima host의 amd64 emulation에서 얻었으므로
+  clean Ubuntu 22.04/24.04 x86_64 native 설치 증거로 확대 해석하지 않는다.
+- Worker는 같은 dev.20의 별도 archive지만 `SELF_CONTAINED=false`, 빈 image inventory,
+  `RVC_RUNTIME_INCLUDED=false`이고 GPU/profile/native Sample gate가 모두 false인 partial이다.
+  Manager 후보가 self-contained라는 사실로 Worker runtime 또는 최종 두 설치 파일 gate를 열지 않는다.
+- dev.20 packaging/image 집중 회귀와 committed source의 clean-tree/source-closure 및
+  `git diff --check`가 통과했다. 저장소 전체의 dev.20 `make check` 기준선은 Python non-E2E
+  `752 passed, 4 deselected`, strict mypy `88 source files`, Web `24 files/211 tests`, lint/build이며
+  localhost HTTP E2E는 `4 passed in 6.68s`였다.
+- 현재 installer는 archive의 `SHA256SUMS` 누락을 실제 Git source root가 아닌 곳에서 거부하고,
   strict SemVer forward upgrade만 허용한다. Target Compose를 pending env로 검증하기 전에는
   `current`/환경을 바꾸지 않으며 uninstall stop/down 오류를 성공으로 보고하지 않는다. dev.15
   bundle-local 문서는 verifier에 `current` symlink를 직접 넘기는 오류가 있으므로 새 설치·시험에는
-  사용하지 않는다. dev.17은 custom CA와 Experiment 비교의 immutable 역사 증거일 뿐
-  `e4c7b9d2f610` model registry schema/source를 포함하지 않으므로 신규 설치·시험 기준으로 쓰지
-  않는다. dev.14 이하의 과거 root-level installer/upgrade script는 guard 자체가 없다.
+  사용하지 않는다. dev.17과 dev.18은 각각 custom CA/Experiment 비교와 model registry의 immutable
+  역사 증거이며, dev.19은 maintenance 최소권한 source를 포함하지만 image 없는 과거 partial이다.
+  dev.14 이하의 과거 root-level installer/upgrade script는 guard 자체가 없다.
 - Self-contained image record는 Docker-save config byte의 실제 SHA-256과 `Config.User`를 함께
   검증한다. Manager API `10001:10001`, Web `nextjs`, MLflow `10002:10002`, Worker runtime
   `10001:10001`을 바꾸려면 Dockerfile, image closure, 실제 non-root smoke와 문서를 같이 검증한다.
-- dev.18 localhost HTTP E2E는 exit code 0과 `4 passed`다. 마지막 Manager 전체 Compose smoke는
-  dev.16 source에서 `Manager full Compose stack smoke: PASS (docker_architecture=arm64)`를 통과했다.
-  후자는 proxy, loopback MinIO/MLflow, API/RQ/MLflow runtime secret 권한과 exact bucket policy를
-  실제 stack에서 확인했지만 clean linux/amd64 release 증거는 아니다.
-- Clean Ubuntu amd64, 실제 외부 TLS/browser, NVIDIA GPU/native runtime, self-contained image
-  closure는 계속 출시 gate로 남긴다. Model registry도 실제 S3 대용량 canonical 재해시와
+- dev.20 Manager release-image 전체 Compose smoke는 proxy, loopback MinIO/MLflow,
+  API/RQ/MLflow runtime secret 권한과 exact bucket policy를 실제 8-image stack에서 확인했다.
+  다만 arm64 host emulation이므로 clean linux/amd64 lifecycle, reboot/rollback과 장기 부하는 별도다.
+- Clean Ubuntu amd64, 실제 외부 TLS/browser, NVIDIA GPU/native Worker runtime과 Worker
+  self-contained image closure는 계속 출시 gate로 남긴다. Model registry도 실제 S3 대용량 canonical 재해시와
   tamper/outage, PostgreSQL 다중 replica promotion 경쟁, browser/API response-loss E2E 전에는
   production 승인 원장 인수를 완료로 판정하지 않는다.
 

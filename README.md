@@ -92,15 +92,19 @@ fixture 결과를 실제 RVC 학습 인증으로 해석하지 않는다.
 
 ## 현재 검증된 개발 설치 번들
 
-dev.19 maintenance 최소권한 source와 schema head `f5d1c8a9b240`을 포함한 partial archive를 생성하고
-외부 sidecar, 내부 exact `SHA256SUMS`, strict ledger/bundle 검증까지 완료했다. 두 archive는 여전히
-`GIT_COMMIT=uncommitted`, `SELF_CONTAINED=false`, empty image inventory이며 Worker activation의 모든
-runtime/GPU/profile/Sample gate가 false이므로 self-contained 또는 production 설치 파일이 아니다.
+dev.20 Manager와 Worker archive는 tracked source commit
+`298ee1ec112cc7dc3a55d8374bba8c9e38f9f55a`와 Manager schema head `f5d1c8a9b240`에 결박돼 있다.
+Manager는 정확히 8개의 linux/amd64 image를 포함한 `SELF_CONTAINED=true` 개발 후보이고, Worker는
+`SELF_CONTAINED=false`, empty image inventory, runtime/GPU/profile/Sample gate가 모두 false인 별도
+partial archive다. 따라서 중앙 서버의 image 포함 기능 시험은 가능하지만 실제 GPU 학습 서버와
+최종 production 설치 파일 인수는 아직 불가능하다.
 
-- `dist/installers/rvc-manager-0.1.0-dev.19-linux-amd64.tar.gz`
-  (`6c76684c640b92e3cc6aa9ee74f1514a81409d6d20ae71bb46183d32eb899393`)
-- `dist/installers/rvc-worker-0.1.0-dev.19-linux-amd64.tar.gz`
-  (`fd63d579dcc8199463a9d0f1d70b2b18ba7f1e7b78a21b6e86f8e8629c2a8f99`)
+- `dist/installers/rvc-manager-0.1.0-dev.20-linux-amd64.tar.gz`
+  (`667617422` byte,
+  `c6488dad47c7f38c082ed6fa68f1fe3691c069110aef0bbf68a9d7ba5e6f5b70`)
+- `dist/installers/rvc-worker-0.1.0-dev.20-linux-amd64.tar.gz`
+  (`108488` byte,
+  `7f36cbf27100bf70425c2780142d4fa3f6e6e76d0acf410d3e3fb698aa50558b`)
 
 각 archive 옆의 `.sha256`, archive 내부 `SHA256SUMS`의 exact inventory와 image manifest v2가
 검증됐다. 압축을 푼 bundle에는 현재 version에 맞춘 `README.md`, `TESTING.md`와
@@ -122,28 +126,26 @@ Worker custom CA installer와 fixed read-only mount/공통 strict SSL context, b
 negative runbook과 설치 가이드의 fail-fast·고정 hash·config-only·secret pre-state 보정을 추가했다.
 dev.18은 이 경계를 보존하면서 model registry 원장/API/BFF/UI와 `e4c7b9d2f610` migration을
 추가했다. dev.19는 전용 maintenance PostgreSQL/Redis/S3 identity, 장기 cleanup heartbeat와
-`f5d1c8a9b240` parent-lock 함수 migration을 추가했다.
+`f5d1c8a9b240` parent-lock 함수 migration을 추가했다. dev.20은 clean committed source에서
+Manager application 3개와 dependency alias 5개를 정확한 linux/amd64 Docker-save closure로 만들고,
+OCI image identity와 config byte digest를 따로 검증하는 self-contained Manager 후보를 추가했다.
 dev.15의 내장 runbook은 `current` symlink를 verifier root로 넘기는 명령 오류가 있고 dev.16은
-custom CA와 이번 runbook audit 보정이 없으므로 새 설치·시험에는 dev.19을 사용한다. dev.14 이하는
-code guard 자체도 없다. dev.19 파일은 설치·업그레이드·백업·복구 스크립트, Compose/프록시 구성,
-Torch 2.6/cu124 후보 lock과
-partial SBOM/license report를 담지만 application image와 검증된 RVC/CUDA runtime image는
-포함하지 않는다. 두 manifest는 `SELF_CONTAINED=false`이고 image/archive inventory가 비어 있다.
-두 manifest의 `GIT_COMMIT=uncommitted`도 production source provenance를 제공하지 못한다.
-따라서 air-gapped 최종 설치 파일이나
-production release가 아니며, clean Ubuntu/NVIDIA VM 및 실제 GPU matrix를 통과하기 전에는
-`v1.0.0`으로 이름을 바꾸거나 release gate 값을 수정하면 안 된다.
-현재 checkout에서 수동 빌드한 image와 dev.19 installer를 조합한 결과도 `SOURCE-MIXED` 기능
-시험일 뿐이다. Trusted scheme 구현은 완료됐지만 clean browser/TLS 종단 검증 전 production
-TLS 판정은 계속 차단한다.
+custom CA와 이번 runbook audit 보정이 없으므로 새 설치·시험에는 dev.20을 사용한다. dev.14 이하는
+code guard 자체도 없다. dev.20 Manager는 설치·업그레이드·백업·복구 스크립트, Compose/프록시,
+partial SBOM/license report와 8개 image를 포함한다. Worker는 동일 version과 source provenance를
+갖지만 runtime image를 포함하지 않으므로 별도 image를 준비해도 `SOURCE-MIXED` 구성 시험일 뿐이다.
+두 설치 파일을 air-gapped production release 또는 `v1.0.0`으로 표현하거나 Worker gate 값을
+수정하면 안 된다. Trusted scheme 구현도 clean browser/TLS 종단 검증 전에는 production 합격으로
+판정하지 않는다.
 
-2026-07-13 dev.19 source의 `make check`는 Python `749 passed, 4 deselected`, strict mypy
+2026-07-13 dev.20 source의 전체 `make check`는 Python `752 passed, 4 deselected`, strict mypy
 88 source files, Web 24 files/211 tests, Ruff, ESLint와 Next.js production build를 통과했다.
-Localhost HTTP E2E는 승인된 socket 환경에서 `4 passed`였다. Maintenance/installer/migration
+Localhost HTTP E2E는 승인된 socket 환경에서 `4 passed in 6.68s`였다. Maintenance/installer/migration
 결합 회귀는 `124 passed`, 실제 PostgreSQL 16 role/function/negative/dry-run smoke와 Redis 7.4,
 MinIO, secret projection 및 전체 Manager Compose smoke가 PASS했고 Alembic head는
-`f5d1c8a9b240`이다. Full Compose 증적은 `docker_architecture=arm64`이므로 최종 amd64 증거가 아니다.
-현재 Git tracked inventory가 0개이므로 이 결과는 executable source 증거이며
-`git diff --check` 기반 whitespace와 committed source provenance는 계속 `BLOCKED`다.
+`f5d1c8a9b240`이다. dev.20은 외부 checksum, 내부 exact ledger, image closure, load 뒤 identity와
+release image 전체 Compose smoke까지 PASS했다. 이 dev.20 runtime smoke는 arm64 Colima의 amd64
+emulation 증거이며 clean Ubuntu x86_64 native 인수는 아니다. dev.20 archive의 40-hex source commit,
+clean-tree/source closure와 tracked revision의 `git diff --check`는 검증됐다.
 정확한 SHA-256, 선행 image 준비와 현재 가능한 시험 범위는
 [설치 가이드](docs/INSTALLATION_GUIDE.md)에서 먼저 확인한다.

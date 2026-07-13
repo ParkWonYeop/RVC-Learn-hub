@@ -273,6 +273,16 @@
   Worker native negative 후 불변 확인을 포함한 사용자 인수 runbook
 - [x] clean committed source와 exact 8-role linux/amd64/user/label을 강제하는 Manager
   self-contained release orchestrator
+- [x] dev.20 Manager self-contained 개발 후보의 외부 checksum·내부 exact ledger·8-role
+  linux/amd64 image closure·load 뒤 identity·release-image 전체 Compose smoke 검증
+  (source `298ee1ec112cc7dc3a55d8374bba8c9e38f9f55a`, schema `f5d1c8a9b240`,
+  `667617422` byte,
+  `c6488dad47c7f38c082ed6fa68f1fe3691c069110aef0bbf68a9d7ba5e6f5b70`;
+  arm64 Colima amd64 emulation이며 clean Ubuntu 증거는 아님)
+- [x] dev.20 Worker partial 별도 번들의 외부 checksum·내부 exact ledger 검증
+  (`108488` byte,
+  `7f36cbf27100bf70425c2780142d4fa3f6e6e76d0acf410d3e3fb698aa50558b`;
+  image/runtime 없음, 모든 GPU/profile/native Sample gate false)
 - [ ] application image와 Torch `>=2.6`/CREPE/GPU 검증 runtime을 포함한 self-contained 최종 번들
 - [x] 재설치/업그레이드 시 설정과 데이터 보존
 - [x] Worker upgrade release-owned env 원자 갱신과 사용자 설정/ack 보존
@@ -315,7 +325,9 @@
 - [x] 자동/HTTP/설치/GPU 단계별 사용자 테스트와 redacted 증적 수집 가이드
 - [x] 환경별 최소 인수 묶음과 PASS/FAIL/BLOCKED를 기록하는 사용자 테스트 결과 템플릿
 - [x] 알려진 제한과 RVC upstream 호환표
-- [ ] tracked Git revision에서 whitespace와 release source provenance 재검증(현재 tracked file 0개)
+- [x] dev.20 설치 번들의 tracked Git revision에서 whitespace와 release source provenance 재검증
+  (40-hex source `298ee1ec112cc7dc3a55d8374bba8c9e38f9f55a`, clean-tree/source-closure build gate와
+  해당 committed revision의 `git diff --check` PASS)
 - [ ] v1.0.0 release note와 두 설치 파일 checksum 검증
 
 ## 11. 장기 운영 고도화

@@ -4,6 +4,27 @@
 
 ## 2026-07-13
 
+### dev.20 Manager self-contained 설치 후보와 실제 기능 스모크
+
+**결과**
+
+- Committed source `298ee1ec112cc7dc3a55d8374bba8c9e38f9f55a`에서 Manager의 정확한 8개
+  `linux/amd64` image를 포함한 self-contained archive와 Worker config-only partial archive를
+  분리 생성했다. Manager SHA-256은
+  `c6488dad47c7f38c082ed6fa68f1fe3691c069110aef0bbf68a9d7ba5e6f5b70`, Worker는
+  `7f36cbf27100bf70425c2780142d4fa3f6e6e76d0acf410d3e3fb698aa50558b`이다.
+- Manager archive의 외부/내부 checksum, tar·image closed-world inventory, loaded identity와
+  non-root amd64 실행을 검증했다. Exact release image full Compose stack과 localhost
+  Manager↔Fake Worker HTTP E2E도 각각 PASS했다. 설치·시험·운영 문서, 체크리스트, 요구사항 추적표와
+  이 인계 문서를 dev.20의 비대칭 Manager/Worker 상태에 맞췄다.
+
+**남은 위험**
+
+- Full-stack 증거는 arm64 Colima의 amd64 emulation이며 clean Ubuntu systemd/TLS/browser 인수는
+  아니다. Worker archive에는 CUDA/RVC runtime이 없으므로 실제 NVIDIA 학습과 49-case qualification은
+  계속 차단한다. 취약점/container/secret scan, 법적 license 검토와 dependency immutable source
+  digest도 남아 있다. 실패·보정 과정을 포함한 상세 구현 기록은 아래 `dev.20 준비` 항목에 있다.
+
 ### GitHub 게시 전 repository ignore 정책 보강
 
 **목적과 변경 범위**
@@ -101,10 +122,34 @@
   API/Web/MLflow image와 exact version/revision을 주입하는 경로를 추가했다. Build 생략 시 세 image
   변수를 모두 요구해 Docker 호출 전에 fail-closed하며, cleanup은 외부 release image를 삭제하지
   않는다. Shell syntax, harness contract 회귀 `1 passed`, 필수 image 누락 negative가 기대 오류로
-  종료되는 것을 확인했다. 실제 dev.20 release-image stack 기동 결과는 별도 실행 증적으로 남긴다.
-- 이 변경은 source preflight 한 단계만 복구한다. 실제 linux/amd64 8-image Manager archive 생성,
-  dependency image의 비어 있는 `Config.User` inspect 처리, clean Ubuntu 설치와 Worker CUDA/RVC
-  runtime qualification은 별도 release gate로 남는다.
+  종료되는 것을 확인했다.
+- 네 번째 실제 build는 commit `298ee1ec112cc7dc3a55d8374bba8c9e38f9f55a`에서 정확히 8개의
+  `linux/amd64` image를 포함한 `rvc-manager-0.1.0-dev.20-linux-amd64.tar.gz`를 생성했다. Archive
+  크기는 `667617422` bytes, SHA-256은
+  `c6488dad47c7f38c082ed6fa68f1fe3691c069110aef0bbf68a9d7ba5e6f5b70`이며
+  `SELF_CONTAINED=true`, schema marker `f5d1c8a9b240`이다. 72개 tar member의 path/type 안전성,
+  외부 sidecar, 54개 내부 `SHA256SUMS`, strict ledger/bundle과 descriptor/config/layer closed-world
+  검사가 PASS했다. API/Web/MLflow user와 version/revision label, dependency의 빈 image user도
+  archive config byte에 결박됐다.
+- 같은 source commit의 Worker dev.20 partial archive도 생성했다. 크기 `108488` bytes, SHA-256
+  `7f36cbf27100bf70425c2780142d4fa3f6e6e76d0acf410d3e3fb698aa50558b`이고 외부/내부 ledger와
+  strict bundle 검사가 PASS했다. 다만 `SELF_CONTAINED=false`, image/runtime 0개, native/GPU/profile/
+  Sample gate false이므로 config-only `--no-start` 설치 시험 범위만 가진다.
+- 수정 후 `make check`는 Ruff, strict mypy 88 files, Python
+  `752 passed, 4 deselected`, Web `24 files/211 tests`, ESLint와 Next.js build를 통과했다.
+  `make test-e2e`의 첫 실행은 sandbox localhost bind 제한으로 4건 모두 거부됐고, 승인된 동일
+  명령의 재실행은 `4 passed in 6.68s`였다.
+- Manager bundle의 `verify-loaded`가 현재 Docker daemon의 8개 image identity와 일치했다. API
+  image는 network-none/read-only/cap-drop/no-new-privileges 조건에서 amd64로 실행돼
+  `PASS uid=10001 arch=x86_64`를 냈다. Exact dev.20 release image full-stack smoke도 migration,
+  PostgreSQL/Redis/MinIO/MLflow, 역할별 secret과 maintenance DB/S3/Redis 권한, RQ, Web, proxy를
+  실제 기동해 `Manager full Compose stack smoke: PASS (docker_architecture=amd64)`로 끝났으며 고유
+  container/volume/network를 정리하고 외부 release image는 보존했다.
+- Manager는 이제 self-contained image 후보와 local emulated runtime 통합 증거가 있지만 clean
+  Ubuntu 22.04/24.04 x86_64 install/upgrade/rollback/restore, 실제 외부 TLS/browser, vulnerability/
+  secret/container scan과 법적 license 검토가 남는다. Dependency upstream tag도 immutable source
+  digest 입력으로 고정해야 한다. Worker CUDA/RVC runtime, 실제 NVIDIA GPU/no-network 49-case
+  qualification과 native 학습/Sample은 계속 출시 gate다.
 
 ### dev.19 maintenance PostgreSQL·Redis·S3 최소권한과 partial 설치 번들
 
