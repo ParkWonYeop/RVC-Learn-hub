@@ -4,6 +4,30 @@
 
 ## 2026-07-13
 
+### Worker runtime build의 committed-source closure
+
+**목적과 변경 범위**
+
+- Runtime builder가 외부 RVC source/wheel/assets는 두 번 검증한 private snapshot으로 사용하면서도
+  orchestrator의 `apps/worker`와 `packages/contracts`는 host working tree에서 `cp -R`하던 경계를
+  제거했다. Ignored cache나 build 중 교체된 byte가 image에 들어가도 OCI revision은 HEAD를 가리킬
+  수 있었으므로 실제 image build는 40-hex commit, clean status와 release source closure를 요구한다.
+- Worker, contracts와 runtime helper는 exact commit의 `git archive`에서만 build context로 추출한다.
+  Docker daemon도 amd64만 허용하고 build platform을 `linux/amd64`로 고정한다. Reviewed digest base가
+  local에 있어야 하고 `--network=none`, `--pull=false`인 기존 offline 경계는 유지한다.
+  `--verify-only`는 image를 만들지 않으므로 Docker/GPU와 clean Git 요구 없이 외부 입력만 계속
+  검증한다.
+
+**검증과 남은 범위**
+
+- `bash -n infra/worker/runtime/build-runtime-image.sh`와 verify-only/TOCTOU/network-closure 집중
+  회귀 `3 passed`, Worker runtime packaging 전체 `13 passed`를 확인했다. Contract 회귀는 clean
+  status, source closure, Git archive,
+  `--platform linux/amd64`, amd64 daemon gate와 host `cp -R` 제거를 고정한다.
+- 실제 reviewed amd64 base digest, 완전한 hashed wheelhouse/asset 입력이 아직 없으므로 runtime image를
+  생성하거나 GPU gate를 열지는 않았다. Reproducible build, vulnerability/container/secret scan,
+  license/redistribution 검토와 NVIDIA 49-case qualification도 계속 필요하다.
+
 ### dev.20 Manager self-contained 설치 후보와 실제 기능 스모크
 
 **결과**

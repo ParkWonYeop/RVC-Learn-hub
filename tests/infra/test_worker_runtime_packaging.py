@@ -515,9 +515,16 @@ def test_real_runtime_dockerfile_and_builder_are_network_closed() -> None:
     assert "git clone" not in dockerfile
     assert "--network=none" in builder
     assert "--pull=false" in builder
+    assert "--platform linux/amd64" in builder
     assert "@sha256:[0-9a-f]{64}" in builder
     assert "{{.Os}}/{{.Architecture}}" in builder
     assert "base_platform == linux/amd64" in builder
+    assert "offline runtime image builds require an amd64 Docker daemon" in builder
+    assert "status --porcelain=v1 --untracked-files=normal" in builder
+    assert "tools/verify_release_source.py" in builder
+    assert "git -C \"$REPO_ROOT\" archive" in builder
+    assert "apps/worker packages/contracts infra/worker/runtime" in builder
+    assert 'cp -R "$REPO_ROOT/apps/worker"' not in builder
     assert "import httpx, pydantic, rvc_orchestrator_contracts, rvc_worker, yaml" in dockerfile
     assert 'org.rvc-orchestrator.profile-stage-set-verified="false"' in dockerfile
     assert "org.rvc-orchestrator.rvc.projection.sha256" in dockerfile

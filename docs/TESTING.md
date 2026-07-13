@@ -361,8 +361,11 @@ duplicate/invalid image manifest와 symlink env도 거부한다.
 ```
 
 `infra/worker/runtime/build-runtime-image.sh --verify-only`도 Docker/GPU 없이 동일한 operator
-input을 검증한다. 실제 `Dockerfile.rvc` build에는 사전 load한 amd64 base digest와 전체
-offline wheel/asset cache가 필요하다. GPU가 없는 test 결과를 실제 학습 smoke로 기록하지
+input을 검증한다. 실제 `Dockerfile.rvc` build에는 clean committed source와 source-closure,
+amd64 Docker daemon, 사전 load한 amd64 base digest와 전체 offline wheel/asset cache가 필요하다.
+Worker/contracts/runtime helper가 exact Git archive에서 나오고 host `cp -R` cache를 쓰지 않는지,
+target `linux/amd64`와 network/pull 차단이 유지되는지도 contract 회귀로 고정한다. GPU가 없는 test
+결과를 실제 학습 smoke로 기록하지
 않는다. guarded native PM/Harvest/CREPE/RMVPE 안전 경계 및 중앙 Sample completion은 fixture로
 검증했다. Production runner factory/capability는 builder-generated qualification activation과
 실제 asset binding이 있을 때만 동적으로 열리지만 실제 GPU/no-network matrix 증적은 아직 없다.

@@ -165,6 +165,9 @@
 - **공유 RVC source 불변**: image/host의 pinned RVC checkout을 cwd로 직접 실행하거나
   그 `logs`, `assets/weights`, `weights`에 쓰지 않는다. 실제 stage는 검증된 allowlist를
   build-generated path/size/SHA-256/mode manifest와 image/bundle provenance에 결박한다.
+  Runtime image build는 clean 40-hex committed orchestrator source와 release source closure를
+  요구하고 Worker/contracts/runtime helper를 exact Git archive에서만 가져온다. Host working tree
+  `cp -R`, ignored cache, non-amd64 daemon 또는 target platform을 생략한 build를 허용하지 않는다.
   attempt의 `work/rvc`에는 expected regular file을 `O_NOFOLLOW` FD로 열어 검증한 동일 byte만
   원자 복제하고, stage마다 read-only private projection의 전체 inventory를 재검증한 뒤에만
   실행한다.

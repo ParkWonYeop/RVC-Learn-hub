@@ -189,7 +189,8 @@ infra/worker/runtime/build-runtime-image.sh \
   --verify-only
 ```
 
-For a build, preload the reviewed base digest locally and add:
+For a build, use a clean repository with a 40-hex committed HEAD on an amd64
+Docker daemon, preload the reviewed base digest locally, and add:
 
 ```bash
 infra/worker/runtime/build-runtime-image.sh \
@@ -205,6 +206,10 @@ infra/worker/runtime/build-runtime-image.sh \
 The generated build manifest and image labels record the base, source,
 wheelhouse, asset, fairseq and RVC pins. The builder also inventories every
 allowlisted source, config and model input used by the native private projection.
+Worker, contracts and runtime-helper files are exported from the exact Git commit
+rather than recursively copied from the host working tree. Ignored caches and
+dirty bytes therefore cannot be hidden under the committed revision label. The
+build is fixed to `linux/amd64`; a non-amd64 daemon fails before image creation.
 `projection-manifest.json` fixes each path, byte size, SHA-256 and source mode;
 its SHA-256 is repeated in `projection-manifest.sha256`, the runtime build
 manifest as `RVC_PROJECTION_MANIFEST_SHA256`, and the image's

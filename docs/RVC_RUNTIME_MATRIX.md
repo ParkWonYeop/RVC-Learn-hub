@@ -7,9 +7,9 @@
 CUDA user-space library, FAISS, fairseq, RVC source와 model asset을 포함하지 않는다.
 따라서 GPU가 Compose에 노출돼도 이 image만으로 실제 학습할 수 없다.
 
-dev.19 installer 변경은 Manager maintenance DB/Redis/S3 최소권한에 한정된다. Worker runtime
-image, RVC source/asset, Torch/CUDA 후보와 49-case qualification 증적을 추가하지 않았으므로 아래
-GPU/native gate는 dev.18과 동일하게 모두 닫혀 있다.
+dev.20 Manager 후보는 application/dependency 8개 image를 self-contained archive로 묶었지만,
+Worker dev.20은 image/runtime이 없는 config-only partial이다. RVC source/asset, Torch/CUDA runtime과
+49-case qualification 증적을 포함하지 않았으므로 아래 GPU/native gate는 계속 모두 닫혀 있다.
 
 ## 검토한 upstream 기준
 
@@ -48,6 +48,10 @@ release 후보는 별도 exact lock과 hashed wheelhouse를 사용하며, 두 up
 Docker base의 실제 linux/amd64 digest, 완전한 wheel/asset hash 입력과 T4/Ampere 이상 NVIDIA
 GPU의 v1/v2 40k/48k, F0/non-F0 조합을 아직 실행하지 않았다. vulnerability/container/secret
 scan과 파일별 재배포 라이선스 검토도 남아 있으므로 release image로 표시하지 않는다.
+실제 runtime image build는 40-hex clean committed orchestrator source, release source closure와
+amd64 Docker daemon을 요구한다. Worker/contract/runtime build byte는 working tree `cp -R`가 아니라
+해당 commit의 Git archive에서만 가져오므로 ignored cache나 dirty source가 image label의 commit과
+어긋날 수 없다. 외부 source/wheel/asset의 `--verify-only` 경로는 Docker/GPU 없이 계속 사용할 수 있다.
 [PyTorch serialization 문서](https://docs.pytorch.org/docs/stable/notes/serialization.html)의
 2.6 기본 동작에 의존하지 않고 loader마다 `weights_only`를 명시한다. `>=2.6`이라는 버전 숫자나
 checksum만으로 operator-trusted pickle의 안전성과 전체 RVC 호환성이 증명됐다고 보지 않는다.
@@ -103,7 +107,8 @@ sample Job을 배정하지 않으며 방어적으로 workspace 생성 전에도 
 1. 모든 base image를 manifest digest로 고정하고 amd64를 확인한다.
 2. exact Torch `2.6.0+cu124`/Torchvision `0.21.0+cu124`/Torchaudio `2.6.0+cu124`
    wheelhouse와 호출별 serialization trust, RVC/fairseq/FAISS/torchcrepe 호환성을 검증한다.
-3. network 없는 rebuild에 사용할 wheel/image/asset cache와 내부 checksum을 만든다.
+3. network 없는 rebuild에 사용할 wheel/image/asset cache와 내부 checksum을 만들고, clean committed
+   orchestrator Git archive와 amd64 build host에서 같은 image identity가 나오는지 검증한다.
 4. `torch.cuda.is_available()`, cuDNN, fairseq, FAISS, ffmpeg import/smoke를 수행한다.
 5. v1/v2 40k/48k 및 F0/non-F0 command snapshot과 1-epoch GPU smoke를 수행한다.
 6. RMVPE CPU/GPU와 multi-GPU shard ID가 실제 visible device에 맞는지 확인한다.

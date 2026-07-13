@@ -137,11 +137,27 @@ fi
 [[ $image_tag =~ ^[A-Za-z0-9][A-Za-z0-9./_-]*:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || \
   die "invalid runtime image tag"
 release_version=${image_tag##*:}
+command -v git >/dev/null 2>&1 || die "Git is required to export the exact orchestrator source"
 orchestrator_source_commit=$(
-  git -C "$REPO_ROOT" rev-parse --verify HEAD 2>/dev/null || printf 'uncommitted'
+  git -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true
 )
+[[ $orchestrator_source_commit =~ ^[0-9a-f]{40}$ ]] || \
+  die "runtime image builds require a committed 40-character orchestrator revision"
+orchestrator_source_status=$(
+  git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=normal 2>/dev/null
+) || die "runtime image build source status could not be inspected"
+[[ -z $orchestrator_source_status ]] || \
+  die "runtime image builds require a clean orchestrator source tree"
+"$python_command" "$REPO_ROOT/tools/verify_release_source.py" --repo-root "$REPO_ROOT" || \
+  die "runtime image builds require a complete non-ignored source closure"
 [[ ! -e $output_manifest ]] || die "output manifest already exists: $output_manifest"
 command -v docker >/dev/null 2>&1 || die "Docker is required to build the runtime image"
+docker_architecture=$(docker info --format '{{.Architecture}}') || \
+  die "Docker daemon architecture could not be inspected"
+case "$docker_architecture" in
+  amd64|x86_64) ;;
+  *) die "offline runtime image builds require an amd64 Docker daemon" ;;
+esac
 docker image inspect "$base_image" >/dev/null 2>&1 || \
   die "digest-pinned base image is not loaded locally; offline build will not pull it"
 base_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$base_image")
@@ -167,14 +183,29 @@ context="$work_parent/context"
 install -d -m 0755 \
   "$context/apps" "$context/packages" "$context/runtime" "$context/manifests" \
   "$context/wheelhouse" "$context/source-extract"
-cp -R "$REPO_ROOT/apps/worker" "$context/apps/worker"
-cp -R "$REPO_ROOT/packages/contracts" "$context/packages/contracts"
-install -m 0644 "$REPO_ROOT/apps/worker/Dockerfile.rvc" "$context/Dockerfile"
+orchestrator_source_archive="$work_parent/orchestrator-source.tar"
+git -C "$REPO_ROOT" archive \
+  --format=tar \
+  --output="$orchestrator_source_archive" \
+  "$orchestrator_source_commit" \
+  apps/worker packages/contracts infra/worker/runtime || \
+  die "exact orchestrator source export failed"
+[[ -f $orchestrator_source_archive && ! -L $orchestrator_source_archive ]] || \
+  die "exact orchestrator source export is missing or unsafe"
+tar --no-same-owner --no-same-permissions -xf "$orchestrator_source_archive" -C "$context"
+[[ -f $context/apps/worker/pyproject.toml && \
+   -f $context/packages/contracts/pyproject.toml && \
+   -f $context/infra/worker/runtime/runtime.lock.env ]] || \
+  die "exact orchestrator source export is incomplete"
+install -m 0644 "$context/apps/worker/Dockerfile.rvc" "$context/Dockerfile"
 for runtime_file in \
   verify_inputs.py runtime_preflight.py runtime-entrypoint.sh git-pin-shim.sh; do
-  install -m 0755 "$SCRIPT_DIR/$runtime_file" "$context/runtime/$runtime_file"
+  install -m 0755 \
+    "$context/infra/worker/runtime/$runtime_file" "$context/runtime/$runtime_file"
 done
-install -m 0644 "$SCRIPT_DIR/runtime.lock.env" "$context/runtime/runtime.lock.env"
+install -m 0644 \
+  "$context/infra/worker/runtime/runtime.lock.env" "$context/runtime/runtime.lock.env"
+rm -r -- "$context/infra"
 install -m 0644 "$snapshot_source_manifest" "$context/manifests/source-manifest.json"
 install -m 0644 "$snapshot_wheelhouse_manifest" "$context/manifests/wheelhouse-manifest.json"
 for wheelhouse_file in "$snapshot_wheelhouse"/*; do
@@ -220,6 +251,7 @@ chmod 0644 "$context/rvc-webui/projection-manifest.sha256"
 
 log "building with network disabled and a preloaded digest-pinned base image"
 docker build \
+  --platform linux/amd64 \
   --network=none \
   --pull=false \
   --build-arg "RVC_BASE_IMAGE=$base_image" \
