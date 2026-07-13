@@ -92,6 +92,11 @@
   dependency build 모두 `--provenance=false`로 고정했다. Verifier는 Docker-save config뿐 아니라
   manifest에 기록된 image identity descriptor의 존재와 content digest를 exact inventory로 검증한다.
   외부 provenance/SBOM/scan gate는 닫힌 상태로 유지한다.
+- 새 image-user template을 포함한 전체 비 E2E 회귀의 첫 실행은 Worker runtime packaging의 가짜
+  Docker 두 곳이 과거 `{{.Config.User}}` 문자열만 인식해 `2 failed, 750 passed, 4 deselected`로
+  끝났다. Fixture가 missing key-safe template을 인식하도록 바꾸고, partial runtime 시험은 실제
+  repository HEAD 유무에 좌우되지 않게 실패하는 가짜 Git으로 `uncommitted` provenance를 고정했다.
+  실패한 두 시험의 집중 재실행은 `2 passed`였다. 제품 image/user 검증은 완화하지 않았다.
 - 이 변경은 source preflight 한 단계만 복구한다. 실제 linux/amd64 8-image Manager archive 생성,
   dependency image의 비어 있는 `Config.User` inspect 처리, clean Ubuntu 설치와 Worker CUDA/RVC
   runtime qualification은 별도 release gate로 남는다.

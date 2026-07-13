@@ -703,7 +703,7 @@ if sys.argv[1:3] == ["image", "inspect"]:
         print("linux")
     elif template == "{{.Architecture}}":
         print("amd64")
-    elif template == "{{.Config.User}}":
+    elif template == '{{with index .Config "User"}}{{.}}{{end}}':
         print("10001:10001")
     elif template == "{{json .RepoTags}}":
         print(json.dumps([image]))
@@ -733,6 +733,9 @@ raise SystemExit(2)
         encoding="utf-8",
     )
     docker.chmod(0o755)
+    git = fake_bin / "git"
+    git.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    git.chmod(0o755)
     environment = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -1058,7 +1061,7 @@ if args[:2] == ["image", "inspect"]:
     if template == "{{.Id}}": print("sha256:" + digest)
     elif template == "{{.Os}}": print("linux")
     elif template == "{{.Architecture}}": print("amd64")
-    elif template == "{{.Config.User}}": print("10001:10001")
+    elif template == '{{with index .Config "User"}}{{.}}{{end}}': print("10001:10001")
     elif template == "{{json .RepoTags}}": print(json.dumps([image]))
     elif template == "{{json .RepoDigests}}": print("[]")
     else:
