@@ -3,6 +3,17 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 PROJECT="rvc-manager-stack-smoke-$$"
+SKIP_BUILD=${RVC_STACK_SMOKE_SKIP_BUILD:-0}
+STACK_VERSION=${RVC_STACK_SMOKE_VERSION:-stack-smoke}
+STACK_REVISION=${RVC_STACK_SMOKE_REVISION:-uncommitted}
+if [ "$SKIP_BUILD" = 1 ]; then
+  [ -n "${RVC_STACK_SMOKE_API_IMAGE:-}" ] && \
+    [ -n "${RVC_STACK_SMOKE_WEB_IMAGE:-}" ] && \
+    [ -n "${RVC_STACK_SMOKE_MLFLOW_IMAGE:-}" ] || {
+      echo "release-image smoke requires explicit API, Web, and MLflow images" >&2
+      exit 1
+    }
+fi
 REMOVE_WORK_PARENT=0
 if [ -n "${RVC_STACK_SMOKE_WORK_PARENT:-}" ]; then
   WORK_PARENT=$RVC_STACK_SMOKE_WORK_PARENT
@@ -22,9 +33,9 @@ ENV_FILE="$WORK_ROOT/manager.env"
 SECRETS_DIR="$WORK_ROOT/secrets"
 COMPOSE_FILE="$ROOT/infra/compose/manager.compose.yml"
 BUILD_FILE="$ROOT/infra/compose/manager.compose.build.yml"
-API_IMAGE="$PROJECT-api:smoke"
-WEB_IMAGE="$PROJECT-web:smoke"
-MLFLOW_IMAGE="$PROJECT-mlflow:smoke"
+API_IMAGE=${RVC_STACK_SMOKE_API_IMAGE:-$PROJECT-api:smoke}
+WEB_IMAGE=${RVC_STACK_SMOKE_WEB_IMAGE:-$PROJECT-web:smoke}
+MLFLOW_IMAGE=${RVC_STACK_SMOKE_MLFLOW_IMAGE:-$PROJECT-mlflow:smoke}
 KEEP=${RVC_STACK_SMOKE_KEEP:-0}
 
 if docker compose version >/dev/null 2>&1; then
@@ -52,7 +63,9 @@ cleanup() {
   fi
   if [ -f "$ENV_FILE" ] && [ "$KEEP" != 1 ]; then
     compose down --volumes --remove-orphans >/dev/null 2>&1 || status=1
-    docker image rm "$API_IMAGE" "$WEB_IMAGE" "$MLFLOW_IMAGE" >/dev/null 2>&1 || true
+    if [ "$SKIP_BUILD" != 1 ]; then
+      docker image rm "$API_IMAGE" "$WEB_IMAGE" "$MLFLOW_IMAGE" >/dev/null 2>&1 || true
+    fi
   elif [ "$KEEP" = 1 ]; then
     echo "Manager stack smoke resources retained: project=$PROJECT work_root=$WORK_ROOT" >&2
   fi
@@ -120,8 +133,8 @@ write_secret jwt_secret "StackSmokeJwtSecret12345678901234567890"
 umask 077
 {
   printf 'COMPOSE_PROJECT_NAME=%s\n' "$PROJECT"
-  printf 'ORCHESTRATOR_VERSION=stack-smoke\n'
-  printf 'GIT_COMMIT=uncommitted\n'
+  printf 'ORCHESTRATOR_VERSION=%s\n' "$STACK_VERSION"
+  printf 'GIT_COMMIT=%s\n' "$STACK_REVISION"
   printf 'ENVIRONMENT=development\n'
   printf 'PUBLIC_SCHEME=http\n'
   printf 'PUBLIC_SERVER_NAME=127.0.0.1\n'
@@ -159,14 +172,14 @@ chmod 0600 "$ENV_FILE"
 
 docker info >/dev/null
 
-if [ "${RVC_STACK_SMOKE_SKIP_BUILD:-0}" != 1 ]; then
+if [ "$SKIP_BUILD" != 1 ]; then
   compose build api web mlflow
 fi
 
 for image in "$API_IMAGE" "$WEB_IMAGE" "$MLFLOW_IMAGE"; do
   [ "$(docker image inspect --format '{{.Os}}' "$image")" = linux ]
-  [ "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")" = stack-smoke ]
-  [ "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")" = uncommitted ]
+  [ "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")" = "$STACK_VERSION" ]
+  [ "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")" = "$STACK_REVISION" ]
 done
 
 docker run --rm --network none --read-only --entrypoint /bin/sh "$WEB_IMAGE" -eu -c '

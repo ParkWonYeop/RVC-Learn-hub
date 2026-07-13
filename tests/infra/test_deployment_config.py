@@ -1055,6 +1055,14 @@ def test_manager_full_stack_smoke_is_isolated_and_checks_real_boundaries() -> No
     script = (ROOT / "tests/infra/manager_full_stack_smoke.sh").read_text(encoding="utf-8")
 
     assert 'PROJECT="rvc-manager-stack-smoke-$$"' in script
+    assert "RVC_STACK_SMOKE_SKIP_BUILD" in script
+    assert "RVC_STACK_SMOKE_API_IMAGE" in script
+    assert "RVC_STACK_SMOKE_WEB_IMAGE" in script
+    assert "RVC_STACK_SMOKE_MLFLOW_IMAGE" in script
+    assert "RVC_STACK_SMOKE_VERSION" in script
+    assert "RVC_STACK_SMOKE_REVISION" in script
+    assert "release-image smoke requires explicit API, Web, and MLflow images" in script
+    assert 'if [ "$SKIP_BUILD" != 1 ]; then' in script
     assert "RVC_STACK_SMOKE_WORK_PARENT" in script
     assert 'WORK_PARENT="$ROOT/.rvc-stack-smoke"' in script
     assert 'WORK_ROOT=$(CDPATH= cd -- "$WORK_ROOT" && pwd -P)' in script

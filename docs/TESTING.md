@@ -585,6 +585,21 @@ application image label을 확인하고 고유 resource만 정리한다. Runtime
 root로 exact inventory·directory/file mode와 owner를 확인하고, 실제 API/RQ/MLflow non-root user로는
 directory enumeration이 거부되면서 allowlist의 알려진 파일만 읽을 수 있는지도 별도로 확인한다.
 
+이미 검증·load한 release image를 그대로 시험할 때는 build를 생략하고 세 application image와
+동일한 version/revision을 모두 명시한다. 세 image 중 하나라도 빠지면 harness는 Docker 호출 전에
+실패하며, 이 경로에서는 cleanup이 외부 release image를 삭제하지 않는다. 실행 전에 반드시 해당
+bundle의 `verify-loaded`를 통과시켜 archive identity와 local daemon image를 결박한다.
+
+```bash
+RVC_STACK_SMOKE_SKIP_BUILD=1 \
+RVC_STACK_SMOKE_API_IMAGE=rvc-orchestrator-api:0.1.0-dev.20 \
+RVC_STACK_SMOKE_WEB_IMAGE=rvc-orchestrator-web:0.1.0-dev.20 \
+RVC_STACK_SMOKE_MLFLOW_IMAGE=rvc-orchestrator-mlflow:0.1.0-dev.20 \
+RVC_STACK_SMOKE_VERSION=0.1.0-dev.20 \
+RVC_STACK_SMOKE_REVISION=298ee1ec112cc7dc3a55d8374bba8c9e38f9f55a \
+make test-manager-full-stack-docker
+```
+
 dev.14부터 `internal: true` storage network를 유지하면서 host publish가 필요한 MinIO·MLflow만
 `host-access` bridge에 연결하고, bundled proxy에 명시적 `nginx -g 'daemon off;'` command와
 zero-argument entrypoint fallback을 둔다. 2026-07-12 local `linux/arm64` Docker에서 이 수정이 포함된

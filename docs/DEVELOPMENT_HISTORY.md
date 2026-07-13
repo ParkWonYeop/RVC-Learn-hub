@@ -97,6 +97,11 @@
   끝났다. Fixture가 missing key-safe template을 인식하도록 바꾸고, partial runtime 시험은 실제
   repository HEAD 유무에 좌우되지 않게 실패하는 가짜 Git으로 `uncommitted` provenance를 고정했다.
   실패한 두 시험의 집중 재실행은 `2 passed`였다. 제품 image/user 검증은 완화하지 않았다.
+- Manager full-stack harness는 source image build 경로 외에 `verify-loaded`를 마친 release
+  API/Web/MLflow image와 exact version/revision을 주입하는 경로를 추가했다. Build 생략 시 세 image
+  변수를 모두 요구해 Docker 호출 전에 fail-closed하며, cleanup은 외부 release image를 삭제하지
+  않는다. Shell syntax, harness contract 회귀 `1 passed`, 필수 image 누락 negative가 기대 오류로
+  종료되는 것을 확인했다. 실제 dev.20 release-image stack 기동 결과는 별도 실행 증적으로 남긴다.
 - 이 변경은 source preflight 한 단계만 복구한다. 실제 linux/amd64 8-image Manager archive 생성,
   dependency image의 비어 있는 `Config.User` inspect 처리, clean Ubuntu 설치와 Worker CUDA/RVC
   runtime qualification은 별도 release gate로 남는다.
