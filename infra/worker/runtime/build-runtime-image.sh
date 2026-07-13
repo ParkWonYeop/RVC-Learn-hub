@@ -250,7 +250,13 @@ printf '%s\n' "$projection_manifest_hash" > \
 chmod 0644 "$context/rvc-webui/projection-manifest.sha256"
 
 log "building with network disabled and a preloaded digest-pinned base image"
-docker build \
+docker_build_command=(docker build)
+if docker buildx version >/dev/null 2>&1; then
+  docker_build_command=(docker buildx build --load --provenance=false)
+else
+  log "Docker Buildx is unavailable; strict docker-save verification remains mandatory"
+fi
+"${docker_build_command[@]}" \
   --platform linux/amd64 \
   --network=none \
   --pull=false \

@@ -593,6 +593,29 @@ def load_runtime_build_manifest(path: Path) -> dict[str, str]:
     return _load_build_manifest(path)
 
 
+def verify_runtime_build_manifest(
+    *,
+    path: Path,
+    image: str,
+    release_version: str,
+    orchestrator_commit: str,
+) -> dict[str, str]:
+    """Validate a build manifest and bind it to the requested release identity."""
+
+    values = _load_build_manifest(path)
+    expected = {
+        "IMAGE": image,
+        "RELEASE_VERSION": release_version,
+        "ORCHESTRATOR_SOURCE_COMMIT": orchestrator_commit,
+    }
+    for key, value in expected.items():
+        if values[key] != value:
+            raise QualificationError(
+                f"runtime build manifest differs from requested {key.lower()}"
+            )
+    return values
+
+
 def _verify_asset_manifest(path: Path, expected_hash: str) -> None:
     content = _read_regular_file(
         path,
@@ -848,6 +871,14 @@ def build_parser() -> argparse.ArgumentParser:
         "disabled", help="emit the exact fail-closed disabled projection"
     )
     disabled.add_argument("--output", type=Path, required=True)
+    verify_build = subparsers.add_parser(
+        "verify-build-manifest",
+        help="validate the strict pre-qualification runtime build identity",
+    )
+    verify_build.add_argument("--runtime-build-manifest", type=Path, required=True)
+    verify_build.add_argument("--image", required=True)
+    verify_build.add_argument("--release-version", required=True)
+    verify_build.add_argument("--orchestrator-commit", required=True)
     return parser
 
 
@@ -863,8 +894,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runtime_image_digest=arguments.runtime_image_digest,
                 output_path=arguments.output,
             )
-        else:
+        elif arguments.command == "disabled":
             disable_activation(output_path=arguments.output)
+        else:
+            verify_runtime_build_manifest(
+                path=arguments.runtime_build_manifest,
+                image=arguments.image,
+                release_version=arguments.release_version,
+                orchestrator_commit=arguments.orchestrator_commit,
+            )
     except QualificationError as exc:
         print(f"qualification error: {exc}", file=sys.stderr)
         return 1

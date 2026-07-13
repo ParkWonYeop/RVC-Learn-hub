@@ -241,6 +241,17 @@ case " $* " in
   *" rev-parse "*) printf '%s\n' "$FAKE_GIT_COMMIT" ;;
   *" status "*) [ "${FAKE_GIT_DIRTY:-0}" = 0 ] || printf ' M dirty\n' ;;
   *" check-ignore "*) cat >/dev/null; exit 1 ;;
+  *" archive "*)
+    output=
+    for argument in "$@"; do
+      case "$argument" in --output=*) output=${argument#--output=} ;; esac
+    done
+    [ -n "$output" ]
+    /usr/bin/tar -cf "$output" -C "$FAKE_GIT_SOURCE_ROOT" \
+      .env.example apps/worker infra installers \
+      docs/TEST_RESULT_TEMPLATE.md tools/generate_supply_chain_report.py \
+      tools/verify_release_source.py supply-chain
+    ;;
   *) exit 2 ;;
 esac
 """,
@@ -255,6 +266,7 @@ def _environment(fake_bin: Path, state: Path, **overrides: str) -> dict[str, str
         **os.environ,
         "FAKE_DOCKER_STATE": str(state),
         "FAKE_GIT_COMMIT": COMMIT,
+        "FAKE_GIT_SOURCE_ROOT": str(ROOT),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         **overrides,
     }

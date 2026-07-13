@@ -52,6 +52,9 @@ scan과 파일별 재배포 라이선스 검토도 남아 있으므로 release i
 amd64 Docker daemon을 요구한다. Worker/contract/runtime build byte는 working tree `cp -R`가 아니라
 해당 commit의 Git archive에서만 가져오므로 ignored cache나 dirty source가 image label의 commit과
 어긋날 수 없다. 외부 source/wheel/asset의 `--verify-only` 경로는 Docker/GPU 없이 계속 사용할 수 있다.
+Self-contained Worker bundle byte도 같은 commit의 Git archive에서만 stage하며 runtime build manifest의
+전체 스키마와 release/orchestrator identity를 qualification 전에도 검증한다. Disabled와 qualified
+activation은 모두 archive에서 `0444`다. 이 상태만으로 GPU/profile/Sample gate를 열지는 않는다.
 [PyTorch serialization 문서](https://docs.pytorch.org/docs/stable/notes/serialization.html)의
 2.6 기본 동작에 의존하지 않고 loader마다 `weights_only`를 명시한다. `>=2.6`이라는 버전 숫자나
 checksum만으로 operator-trusted pickle의 안전성과 전체 RVC 호환성이 증명됐다고 보지 않는다.

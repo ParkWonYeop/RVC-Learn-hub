@@ -1026,6 +1026,13 @@ uninstall도 config와 CA를 보존한다.
 - 검토한 `pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime@sha256:<digest>` amd64 base
 - clean committed source tree와 runtime build manifest
 
+Self-contained bundle builder는 현재 working tree를 archive에 복사하지 않는다. Infra, installer,
+검증기, 문서와 supply-chain 입력은 선언한 clean 40-hex commit의 exact Git export에서 가져오며,
+runtime build manifest는 qualification 유무와 관계없이 exact schema, release version,
+orchestrator commit과 reviewed runtime provenance를 통과해야 한다. Disabled activation도 extracted
+archive에서 mode `0444`여야 한다. 이 검증 실패를 manifest 편집이나 chmod 사후 보정으로 우회하지
+않고 새 clean source와 새 release version으로 다시 만든다.
+
 먼저 Docker/GPU 없이 입력만 검증할 수 있다.
 
 ```bash

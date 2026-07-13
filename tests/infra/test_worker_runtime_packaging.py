@@ -515,6 +515,7 @@ def test_real_runtime_dockerfile_and_builder_are_network_closed() -> None:
     assert "git clone" not in dockerfile
     assert "--network=none" in builder
     assert "--pull=false" in builder
+    assert "--provenance=false" in builder
     assert "--platform linux/amd64" in builder
     assert "@sha256:[0-9a-f]{64}" in builder
     assert "{{.Os}}/{{.Architecture}}" in builder
@@ -630,10 +631,15 @@ exit "$status"
 def test_worker_bundle_can_include_only_a_matching_verified_runtime(tmp_path: Path) -> None:
     assets, asset_manifest = _asset_input(tmp_path / "assets")
     asset_hash = _sha256(asset_manifest)
-    source_hash = "a" * 64
-    wheel_hash = "b" * 64
-    projection_hash = "c" * 64
-    base_image = "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime@sha256:" + "d" * 64
+    source_hash = hashlib.sha256(b"bundle-source-manifest").hexdigest()
+    wheel_hash = hashlib.sha256(b"bundle-wheelhouse-manifest").hexdigest()
+    projection_hash = hashlib.sha256(b"bundle-projection-manifest").hexdigest()
+    base_image = (
+        "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime@sha256:"
+        + hashlib.sha256(b"bundle-base-image").hexdigest()
+    )
+    orchestrator_commit = hashlib.sha1(b"bundle-orchestrator").hexdigest()
+    fairseq_commit = hashlib.sha1(b"bundle-fairseq").hexdigest()
     image = "rvc-orchestrator-worker:9.8.7"
     build_manifest = tmp_path / "runtime-build.env"
     build_manifest.write_text(
@@ -643,13 +649,15 @@ def test_worker_bundle_can_include_only_a_matching_verified_runtime(tmp_path: Pa
                 "PRODUCT=rvc-training-orchestrator",
                 "COMPONENT=worker-rvc-runtime",
                 f"IMAGE={image}",
+                "RELEASE_VERSION=9.8.7",
+                f"ORCHESTRATOR_SOURCE_COMMIT={orchestrator_commit}",
                 f"BASE_IMAGE={base_image}",
                 f"RVC_SOURCE_COMMIT={RVC_COMMIT}",
                 f"RVC_SOURCE_MANIFEST_SHA256={source_hash}",
                 f"RVC_WHEELHOUSE_MANIFEST_SHA256={wheel_hash}",
                 f"RVC_ASSET_MANIFEST_SHA256={asset_hash}",
                 f"RVC_PROJECTION_MANIFEST_SHA256={projection_hash}",
-                f"RVC_FAIRSEQ_COMMIT={FAIRSEQ_COMMIT}",
+                f"RVC_FAIRSEQ_COMMIT={fairseq_commit}",
                 "RVC_TORCH_VERSION=2.6.0+cu124",
                 "RVC_CUDA_RUNTIME_VERSION=12.4",
                 "RVC_CUDNN_MAJOR=9",
@@ -675,7 +683,7 @@ import tarfile
 image = "rvc-orchestrator-worker:9.8.7"
 labels = {
     "org.opencontainers.image.version": "9.8.7",
-    "org.opencontainers.image.revision": "uncommitted",
+    "org.opencontainers.image.revision": os.environ["ORCHESTRATOR_COMMIT"],
     "org.rvc-orchestrator.runtime": "rvc",
     "org.rvc-orchestrator.rvc.commit": os.environ["RVC_SOURCE_COMMIT"],
     "org.rvc-orchestrator.rvc.python": "3.11",
@@ -741,7 +749,17 @@ raise SystemExit(2)
     )
     docker.chmod(0o755)
     git = fake_bin / "git"
-    git.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    git.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'case " $* " in\n'
+        '  *" rev-parse "*) printf \'%s\\n\' "$ORCHESTRATOR_COMMIT" ;;\n'
+        '  *" status "*) : ;;\n'
+        '  *" check-ignore "*) cat >/dev/null; exit 1 ;;\n'
+        "  *) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
     git.chmod(0o755)
     environment = {
         **os.environ,
@@ -752,7 +770,8 @@ raise SystemExit(2)
         "RVC_WHEEL_HASH": wheel_hash,
         "RVC_ASSET_HASH": asset_hash,
         "RVC_PROJECTION_HASH": projection_hash,
-        "RVC_FAIRSEQ_COMMIT": FAIRSEQ_COMMIT,
+        "RVC_FAIRSEQ_COMMIT": fairseq_commit,
+        "ORCHESTRATOR_COMMIT": orchestrator_commit,
     }
     command = [
         "bash",
@@ -816,7 +835,7 @@ raise SystemExit(2)
         env=environment,
     )
     assert mismatched_runtime.returncode != 0
-    assert "Torch/CUDA/cuDNN lock" in mismatched_runtime.stderr
+    assert "RVC_TORCH_VERSION is not fixed" in mismatched_runtime.stderr
     build_manifest.write_text(reviewed_build_manifest, encoding="utf-8")
 
     extracted = tmp_path / "installer-mode-mismatch"
@@ -1100,6 +1119,17 @@ raise SystemExit(2)
         f"  *\" rev-parse \"*) printf '%s\\n' '{orchestrator_commit}' ;;\n"
         '  *" status "*) : ;;\n'
         '  *" check-ignore "*) cat >/dev/null; exit 1 ;;\n'
+        '  *" archive "*)\n'
+        "    output=\n"
+        '    for argument in "$@"; do\n'
+        '      case "$argument" in --output=*) output=${argument#--output=} ;; esac\n'
+        "    done\n"
+        '    [ -n "$output" ]\n'
+        '    /usr/bin/tar -cf "$output" -C "$FAKE_GIT_SOURCE_ROOT" '
+        ".env.example apps/worker infra installers "
+        "docs/TEST_RESULT_TEMPLATE.md tools/generate_supply_chain_report.py "
+        "tools/verify_release_source.py supply-chain\n"
+        "    ;;\n"
         "  *) exit 2 ;;\n"
         "esac\n",
         encoding="utf-8",
@@ -1136,6 +1166,7 @@ raise SystemExit(2)
             **os.environ,
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "FAKE_DOCKER_STATE": str(state),
+            "FAKE_GIT_SOURCE_ROOT": str(ROOT),
         },
     )
     assert result.returncode == 0, result.stdout + result.stderr

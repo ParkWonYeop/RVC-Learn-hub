@@ -46,30 +46,74 @@ cleanup_work_parent() {
   esac
 }
 trap cleanup_work_parent EXIT
+git_commit=$(git -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || \
+  printf 'uncommitted')
+source_root=$REPO_ROOT
+if [[ $self_contained == true ]]; then
+  rvc_require_command git
+  [[ $git_commit =~ ^[0-9a-f]{40}$ ]] || \
+    rvc_die "self-contained bundles require a committed source revision"
+  git_status=$(
+    git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=normal 2>/dev/null
+  ) || rvc_die "self-contained bundle source status could not be inspected"
+  [[ -z $git_status ]] || rvc_die "self-contained bundles require a clean source tree"
+
+  committed_archive="$work_parent/committed-source.tar"
+  committed_source="$work_parent/committed-source"
+  install -d -m 0700 "$committed_source"
+  git -C "$REPO_ROOT" archive \
+    --format=tar --output="$committed_archive" "$git_commit" || \
+    rvc_die "exact committed bundle source export failed"
+  tar --no-same-owner --no-same-permissions -xf "$committed_archive" \
+    -C "$committed_source" || rvc_die "exact committed bundle source extraction failed"
+  rm -f -- "$committed_archive"
+  [[ -f $committed_source/tools/verify_release_source.py && \
+     ! -L $committed_source/tools/verify_release_source.py ]] || \
+    rvc_die "exact committed bundle source export is incomplete"
+  python3 "$committed_source/tools/verify_release_source.py" \
+    --repo-root "$REPO_ROOT" || \
+    rvc_die "self-contained bundles require a complete non-ignored source closure"
+  current_commit=$(
+    git -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true
+  )
+  current_status=$(
+    git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=normal 2>/dev/null
+  ) || rvc_die "self-contained bundle source status could not be re-inspected"
+  [[ $current_commit == "$git_commit" && -z $current_status ]] || \
+    rvc_die "self-contained bundle source changed during committed export"
+  source_root=$committed_source
+fi
+
 stage="$work_parent/rvc-worker-$version-linux-amd64"
 install -d -m 0755 "$stage/common"
-cp -R "$REPO_ROOT/infra" "$stage/infra"
-install -m 0644 "$REPO_ROOT/.env.example" "$stage/.env.example"
-sed "s/{{VERSION}}/$version/g" "$SCRIPT_DIR/BUNDLE_README.md" > "$stage/README.md"
+cp -R "$source_root/infra" "$stage/infra"
+activation_path="$stage/infra/worker/runtime/runtime-activation.json"
+[[ -f $activation_path && ! -L $activation_path ]] || \
+  rvc_die "Worker runtime activation source is missing or unsafe"
+chmod 0444 "$activation_path"
+install -m 0644 "$source_root/.env.example" "$stage/.env.example"
+sed "s/{{VERSION}}/$version/g" \
+  "$source_root/installers/worker/BUNDLE_README.md" > "$stage/README.md"
 sed -e '/@@MANAGER_ONLY_BEGIN@@/,/@@MANAGER_ONLY_END@@/d' \
   -e '/@@WORKER_ONLY_BEGIN@@/d' -e '/@@WORKER_ONLY_END@@/d' \
   -e "s/{{COMPONENT}}/worker/g" -e "s/{{VERSION}}/$version/g" \
-  "$SCRIPT_DIR/../common/BUNDLE_TESTING.md" > "$stage/TESTING.md"
-install -m 0644 "$REPO_ROOT/docs/TEST_RESULT_TEMPLATE.md" \
+  "$source_root/installers/common/BUNDLE_TESTING.md" > "$stage/TESTING.md"
+install -m 0644 "$source_root/docs/TEST_RESULT_TEMPLATE.md" \
   "$stage/TEST_RESULT_TEMPLATE.md"
 if grep -Eq '\{\{(COMPONENT|VERSION)\}\}|@@(MANAGER|WORKER)_ONLY_' \
   "$stage/README.md" "$stage/TESTING.md"; then
   rvc_die "Worker bundle documentation contains an unresolved template marker"
 fi
 chmod 0644 "$stage/README.md" "$stage/TESTING.md" "$stage/TEST_RESULT_TEMPLATE.md"
-install -m 0644 "$SCRIPT_DIR/../common/lib.sh" "$stage/common/lib.sh"
-install -m 0644 "$SCRIPT_DIR/../common/image_bundle.py" "$stage/common/image_bundle.py"
-install -m 0644 "$REPO_ROOT/apps/worker/src/rvc_worker/tls.py" \
+install -m 0644 "$source_root/installers/common/lib.sh" "$stage/common/lib.sh"
+install -m 0644 "$source_root/installers/common/image_bundle.py" \
+  "$stage/common/image_bundle.py"
+install -m 0644 "$source_root/apps/worker/src/rvc_worker/tls.py" \
   "$stage/common/worker_ca.py"
 for script in install.sh upgrade.sh uninstall.sh preflight.sh compose.sh; do
-  install -m 0755 "$SCRIPT_DIR/$script" "$stage/$script"
+  install -m 0755 "$source_root/installers/worker/$script" "$stage/$script"
 done
-python3 "$REPO_ROOT/tools/generate_supply_chain_report.py" \
+python3 "$source_root/tools/generate_supply_chain_report.py" \
   --component worker \
   --version "$version" \
   --output-dir "$stage/supply-chain"
@@ -85,7 +129,6 @@ runtime_projection_manifest_hash=none
 gpu_smoke_verified=false
 profile_stage_set_verified=false
 native_sample_inference_verified=false
-git_commit=$(git -C "$REPO_ROOT" rev-parse --verify HEAD 2>/dev/null || printf 'uncommitted')
 runtime_arguments=(
   "$runtime_image" "$runtime_assets" "$runtime_asset_manifest" "$runtime_build_manifest"
 )
@@ -129,12 +172,21 @@ if (( runtime_argument_count == 4 )); then
     rvc_die "runtime build manifest is missing or unsafe"
   rvc_require_command python3
   rvc_require_command docker
-  python3 "$REPO_ROOT/infra/worker/runtime/verify_inputs.py" assets \
+  python3 "$source_root/infra/worker/runtime/verify_inputs.py" assets \
     --manifest "$runtime_asset_manifest" --root "$runtime_assets" >/dev/null
   runtime_asset_manifest_hash=$(rvc_sha256_file "$runtime_asset_manifest")
+  python3 "$source_root/infra/worker/runtime/qualification.py" \
+    verify-build-manifest \
+    --runtime-build-manifest "$runtime_build_manifest" \
+    --image "$runtime_image" \
+    --release-version "$version" \
+    --orchestrator-commit "$git_commit" || \
+    rvc_die "runtime build manifest is not the exact requested release identity"
   [[ $(build_manifest_value RUNTIME_BUILD_FORMAT_VERSION) == 1 && \
      $(build_manifest_value COMPONENT) == worker-rvc-runtime && \
-     $(build_manifest_value IMAGE) == "$runtime_image" ]] || \
+     $(build_manifest_value IMAGE) == "$runtime_image" && \
+     $(build_manifest_value RELEASE_VERSION) == "$version" && \
+     $(build_manifest_value ORCHESTRATOR_SOURCE_COMMIT) == "$git_commit" ]] || \
     rvc_die "runtime build manifest identity does not match the requested image"
   runtime_source_commit=$(build_manifest_value RVC_SOURCE_COMMIT)
   runtime_base_image=$(build_manifest_value BASE_IMAGE)
@@ -187,7 +239,7 @@ if (( runtime_argument_count == 4 )); then
   install -d -m 0755 "$stage/runtime"
   install -m 0644 "$runtime_asset_manifest" "$stage/runtime/assets-manifest.json"
   install -m 0644 "$runtime_build_manifest" "$stage/runtime/build-manifest.env"
-  install -m 0644 "$REPO_ROOT/infra/worker/runtime/runtime.lock.env" \
+  install -m 0644 "$source_root/infra/worker/runtime/runtime.lock.env" \
     "$stage/runtime/runtime.lock.env"
   if (( qualification_argument_count == 2 )); then
     [[ $self_contained == true ]] || \
@@ -209,7 +261,7 @@ if (( runtime_argument_count == 4 )); then
       "$stage/runtime/qualification/$runtime_qualification_evidence_name"
     runtime_image_digest=$(docker image inspect --format '{{.Id}}' "$runtime_image")
     activation_output="$stage/runtime/runtime-activation.generated.json"
-    python3 "$REPO_ROOT/infra/worker/runtime/qualification.py" project \
+    python3 "$source_root/infra/worker/runtime/qualification.py" project \
       --qualification "$stage/runtime/qualification/qualification.json" \
       --evidence-archive \
         "$stage/runtime/qualification/$runtime_qualification_evidence_name" \
@@ -228,12 +280,6 @@ if (( runtime_argument_count == 4 )); then
 fi
 
 if [[ $self_contained == true ]]; then
-  [[ $git_commit =~ ^[0-9a-f]{40}$ ]] || \
-    rvc_die "self-contained bundles require a committed source revision"
-  [[ -z $(git -C "$REPO_ROOT" status --porcelain --untracked-files=normal 2>/dev/null) ]] || \
-    rvc_die "self-contained bundles require a clean source tree"
-  python3 "$REPO_ROOT/tools/verify_release_source.py" --repo-root "$REPO_ROOT" || \
-    rvc_die "self-contained bundles require a complete non-ignored source closure"
   [[ $runtime_included == true ]] || \
     rvc_die "self-contained Worker bundles require the verified runtime image"
   (( ${#images[@]} == 0 )) || \
@@ -326,12 +372,15 @@ image_manifest_arguments=()
 for image_spec in ${image_specs[@]+"${image_specs[@]}"}; do
   image_manifest_arguments+=(--image "$image_spec")
 done
-python3 "$SCRIPT_DIR/../common/image_bundle.py" create \
+python3 "$source_root/installers/common/image_bundle.py" create \
   --root "$stage" --component worker --version "$version" \
   --source-commit "$git_commit" --self-contained "$self_contained" \
   ${image_manifest_arguments[@]+"${image_manifest_arguments[@]}"}
 
 rvc_prune_host_cache_files "$stage"
+[[ -f $activation_path && ! -L $activation_path ]] || \
+  rvc_die "Worker runtime activation became unsafe during bundle staging"
+chmod 0444 "$activation_path"
 
 (
   cd "$stage"

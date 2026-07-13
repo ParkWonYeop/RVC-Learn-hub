@@ -1217,6 +1217,10 @@ unset NATIVE_GATE_LOG
 현재 dev.20 partial 계약만 있고 self-contained runtime bundle이 없다면 T5는 `FAIL`이
 아니라 사유를 적은 `BLOCKED`로 기록한다.
 `RVC_RUNNER_MODE=fake` 또는 generic Agent image에서 나온 결과는 어떤 경우에도 T5에 제출하지 않는다.
+향후 core 후보가 생겨도 먼저 archive의 external checksum/internal exact ledger,
+`SELF_CONTAINED=true`, exact runtime image 1개, runtime build manifest release/commit binding과
+activation mode `444`를 확인한다. 세 activation gate가 false면
+`NATIVE-CANDIDATE-UNVERIFIED` engineering 범위이며 production/Sample PASS로 기록하지 않는다.
 
 dev.20은 custom CA를 지원하지만 아래 시험을 통과해야 하며, host trust store만 수정하거나 TLS
 검증 비활성화/image CA store 수동 변경 결과는

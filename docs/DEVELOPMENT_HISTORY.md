@@ -4,6 +4,45 @@
 
 ## 2026-07-13
 
+### Worker bundle committed-source·strict runtime identity 경계
+
+**목적과 변경 범위**
+
+- Self-contained Worker bundle이 `GIT_COMMIT`을 기록하면서 infra, installer, verifier, TLS helper,
+  문서와 supply-chain report 입력은 mutable working tree에서 복사하던 경계를 제거했다. Clean
+  40-hex HEAD와 source closure를 stage 전에 확인하고 exact `git archive`를 private directory에
+  추출한 뒤 bundle byte 전체를 그 export에서만 가져온다. Export 뒤에도 HEAD/status를 다시 확인한다.
+- `qualification.py verify-build-manifest`를 추가해 qualification이 없는 core 후보도 runtime build
+  manifest의 exact key 집합, product/component, image/release/orchestrator commit, reviewed
+  RVC/Torch/CUDA/cuDNN lock과 provenance hash 및 false pre-qualification gate를 통과하게 했다.
+  Worker bundle builder는 이 검증을 runtime label/archive 생성보다 먼저 수행한다.
+- Git이 read-only bit를 보존하지 않는 문제를 피하도록 disabled/qualified activation을 bundle stage와
+  ledger 생성 직전에 명시적으로 mode `0444`로 고정했다. Bundle-local 문서는 fully-qualified
+  production service 시작과 `NATIVE-CANDIDATE-UNVERIFIED`의 승인된 core engineering 시험을 분리하고
+  후자에서는 systemd production start와 Sample 합격 판정을 금지한다.
+- Runtime image build는 Buildx가 있을 때 `--provenance=false`를 사용해 single-platform Docker-save
+  closure에 default attestation descriptor가 섞이지 않게 했다. Buildx가 없으면 amd64/offline build와
+  strict archive 검증은 유지하며 이 설정을 외부 provenance·scan 증거로 취급하지 않는다.
+
+**변경 파일과 검증**
+
+- 변경: `installers/worker/build-bundle.sh`, `installers/worker/BUNDLE_README.md`,
+  `infra/worker/runtime/build-runtime-image.sh`, `infra/worker/runtime/qualification.py`, 관련 installer/
+  runtime/image-closure 시험과 `AGENTS.md`, 체크리스트, runtime/supply-chain/testing/추적 문서.
+- `bash -n`은 두 build script를 통과했고 Ruff는 변경 Python/test 파일을 통과했다.
+  Runtime qualification, Worker runtime packaging과 image bundle closure 집중 회귀는 수집된 67건을
+  모두 통과했다. Missing/extra/wrong-product build manifest와 요청 image/version/commit 불일치,
+  reviewed lock 변조 및 activation mode를 포함한다.
+
+**남은 위험**
+
+- 이 변경은 안전한 factory 기반을 만든 것이며 실제 Worker runtime image나 설치 archive를 생성한
+  증거가 아니다. Reviewed amd64 base digest, 완전한 wheelhouse와 27개 asset byte, license/scan,
+  NVIDIA 49-case와 clean Ubuntu 설치 증적이 없으므로 production/GPU/Sample gate는 모두 닫혀 있다.
+- Factory의 private output 검증·race-safe no-clobber publish와 실패 시 소유 Docker tag 정리는 다음
+  작은 작업 단위로 계속 구현한다. Qualification report 내용 schema/reviewer attestation 강화도 별도
+  출시 보안 작업이다.
+
 ### Worker runtime build의 committed-source closure
 
 **목적과 변경 범위**

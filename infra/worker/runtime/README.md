@@ -247,12 +247,17 @@ installers/worker/build-bundle.sh \
 ```
 
 The runtime image must use the exact tag selected by the installer. The bundle
-builder re-hashes every asset, checks all provenance labels including the
+builder exports its infra, installer, verifier, documentation and supply-chain
+inputs from the same clean committed Git revision instead of copying mutable host
+working-tree bytes. It validates the complete runtime build-manifest schema even
+before qualification, re-hashes every asset, checks all provenance labels including the
 projection-manifest SHA-256, verifies amd64, and then stores a Docker image
 archive plus asset/build manifests. Generic `--include-image` cannot duplicate
 the runtime image. The resulting manifest carries
 `RVC_PROJECTION_MANIFEST_SHA256`, sets `RVC_NATIVE_RUNNER_AVAILABLE=true`, and
-keeps `RVC_NATIVE_SAMPLE_INFERENCE_VERIFIED=false`.
+keeps `RVC_NATIVE_SAMPLE_INFERENCE_VERIFIED=false`. The disabled activation is
+also explicitly stored as mode `0444`; it does not depend on the host checkout's
+file mode.
 
 After the real matrix has run, provide both the strict qualification JSON and its
 49-report evidence archive. The bundle builder validates them against the exact

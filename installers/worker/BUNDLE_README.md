@@ -232,9 +232,9 @@ sudo "$WORKER_ROOT/bin/worker-compose" run --rm --no-deps worker --check \
 시험 외에 추가하지 않는다. 설치 exit code 0만으로 native 학습을 시작하지
 않고 `TESTING.md`의 ledger, image/runtime activation, GPU/no-network 인수를 먼저 끝낸다.
 
-## 4. 실제 시작 gate
+## 4. Production service 시작 gate
 
-아래 조건을 모두 충족한 runtime 후보에서만 Worker를 시작한다.
+아래 조건을 모두 충족한 runtime 후보에서만 production Worker service를 시작한다.
 
 - `SELF_CONTAINED=true`, runtime/native/GPU/profile gate true
 - image `linux/amd64`, user `10001:10001`, expected release label/digest
@@ -243,6 +243,14 @@ sudo "$WORKER_ROOT/bin/worker-compose" run --rm --no-deps worker --check \
   Host trust store에만 추가한 CA, `verify=false`, `curl -k`는 증거가 아님
 - 설치된 token/profile/data/activation 권한과 exact release ledger PASS
 - 실제 GPU core matrix; Sample은 qualification과 inference gate까지 true인 경우에만 허용
+
+세 gate가 모두 `false`인 self-contained core 후보는 정식 출시품이 아니다. 승인된
+release-engineering 시험에서만 설치 시 `--runner-mode native
+--allow-unverified-gpu-runtime --no-start`를 함께 사용하고, 위의 installed wrapper one-shot과
+제한된 core GPU 시험만 수행한다. 이 상태는 `NATIVE-CANDIDATE-UNVERIFIED`이며 systemd production
+enable/start와 Sample Job 합격 판정을 금지한다. `fixed_test_set_inference_ready=false`와 빈
+inference F0 목록이 정상이다. Qualification 두 입력과 별도 공급망/clean-host 출시 gate가 모두
+검증되기 전에는 아래 production service 명령을 실행하지 않는다.
 
 ```bash
 sudo systemctl daemon-reload

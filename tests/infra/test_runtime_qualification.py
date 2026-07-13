@@ -230,6 +230,35 @@ def _run_project(
     )
 
 
+def _run_verify_build(
+    fixture: dict[str, Any],
+    *,
+    image: str | None = None,
+    release_version: str | None = None,
+    orchestrator_commit: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    runtime = fixture["runtime"]
+    return subprocess.run(
+        [
+            sys.executable,
+            str(QUALIFICATION_SCRIPT),
+            "verify-build-manifest",
+            "--runtime-build-manifest",
+            str(fixture["build_manifest"]),
+            "--image",
+            image or f"rvc-orchestrator-worker-rvc:{runtime['release_version']}",
+            "--release-version",
+            release_version or runtime["release_version"],
+            "--orchestrator-commit",
+            orchestrator_commit or runtime["orchestrator_commit"],
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+
+
 def _refresh_archive_record(fixture: dict[str, Any]) -> None:
     evidence = fixture["evidence"]
     fixture["qualification"]["evidence_archive"] = {
@@ -238,6 +267,41 @@ def _refresh_archive_record(fixture: dict[str, Any]) -> None:
         "sha256": _sha256_file(evidence),
     }
     _write_json(fixture["qualification_path"], fixture["qualification"])
+
+
+def test_build_manifest_cli_binds_strict_schema_to_requested_release(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    assert _run_verify_build(fixture).returncode == 0
+
+    original = fixture["build_manifest"].read_text(encoding="utf-8")
+    mutations = (
+        (
+            original.replace("PRODUCT=rvc-training-orchestrator\n", ""),
+            "fields differ",
+        ),
+        (original + "UNEXPECTED=value\n", "fields differ"),
+        (
+            original.replace(
+                "PRODUCT=rvc-training-orchestrator",
+                "PRODUCT=unsupported-product",
+            ),
+            "identity is unsupported",
+        ),
+    )
+    for content, expected in mutations:
+        fixture["build_manifest"].write_text(content, encoding="utf-8")
+        result = _run_verify_build(fixture)
+        assert result.returncode != 0
+        assert expected in result.stderr
+    fixture["build_manifest"].write_text(original, encoding="utf-8")
+
+    for result in (
+        _run_verify_build(fixture, image="rvc-orchestrator-worker-rvc:wrong"),
+        _run_verify_build(fixture, release_version="wrong"),
+        _run_verify_build(fixture, orchestrator_commit=_commit("wrong")),
+    ):
+        assert result.returncode != 0
+        assert "differs from requested" in result.stderr
 
 
 def test_verify_api_checks_complete_chain_without_writing_activation(tmp_path: Path) -> None:

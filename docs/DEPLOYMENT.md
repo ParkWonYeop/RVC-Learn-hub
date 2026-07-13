@@ -418,6 +418,11 @@ network와 pull을 비활성화한다. image build에서는 CPU 수준 import/as
 container 시작 시에는 CUDA GPU가 필수인 runtime preflight를 실행한다. 이 구조가 있다는
 사실은 GPU 학습 완료를 뜻하지 않는다. v1/v2 × 40k/48k × F0/non-F0 one-epoch,
 RMVPE/multi-GPU, artifact 의미와 clean-VM offline rebuild는 여전히 release gate다.
+Self-contained Worker bundle의 infra/installer/verifier/document/SBOM 입력도 clean commit의 exact
+Git archive에서만 stage한다. Runtime build manifest는 qualification 전에도 exact schema와
+image/release/orchestrator identity를 검증하며 disabled activation을 mode `0444`로 고정한다.
+Buildx runtime build는 default provenance descriptor를 섞지 않도록 `--provenance=false`를 사용하되,
+별도 SBOM·scan·source attestation gate는 계속 요구한다.
 Worker의 `native` mode는 reviewed source를 job-local로 투영해
 preprocess/extract/train/index/export를 수행한다. 생성 시와 claim 직전에 source commit과
 `assets-manifest.json`의 모든 byte/hash를 검증하고, claim GPU/RMVPE ID를 현재 visible GPU와

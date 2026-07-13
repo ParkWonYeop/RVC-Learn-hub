@@ -275,6 +275,8 @@
   self-contained release orchestrator
 - [x] Worker runtime image build의 clean committed source/source-closure, exact Git archive와
   `linux/amd64` daemon/platform gate(실제 runtime/GPU qualification은 별도 미완료)
+- [x] Worker self-contained bundle byte의 exact committed-source export, strict runtime build manifest와
+  disabled/qualified activation `0444` 고정(실제 runtime 입력·GPU qualification은 별도 미완료)
 - [x] dev.20 Manager self-contained 개발 후보의 외부 checksum·내부 exact ledger·8-role
   linux/amd64 image closure·load 뒤 identity·release-image 전체 Compose smoke 검증
   (source `298ee1ec112cc7dc3a55d8374bba8c9e38f9f55a`, schema `f5d1c8a9b240`,

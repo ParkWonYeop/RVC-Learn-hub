@@ -332,6 +332,10 @@
   Single-platform installer image는 Buildx default provenance attestation을 image 안에 섞지 않고
   `--provenance=false`로 export하며, Docker-save에는 exact runtime identity descriptor/config/layer
   closure만 허용한다. 외부 SBOM·scan·source provenance gate를 이 설정으로 대체하지 않는다.
+  Self-contained Worker bundle의 installer/infra/verifier/document/SBOM 입력은 clean 40-hex commit의
+  exact Git archive에서만 가져온다. Runtime build manifest는 qualification 유무와 관계없이 exact
+  schema, release version, orchestrator commit과 image identity를 검증하고 disabled activation도
+  archive 안에서 mode `0444`를 유지한다.
   Cross-architecture Buildx release는 dependency source tag도 target platform의 zero-layer image로
   materialize한 뒤 실제 architecture를 검사한다. `docker pull --platform` 출력만으로 target tag의
   local platform을 증명하지 않는다. Manager dependency image는 rollback tag overwrite를 막는
