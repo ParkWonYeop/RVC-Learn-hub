@@ -16,6 +16,7 @@ const JOB_ID = "33333333-3333-4333-8333-333333333333";
 const ATTEMPT_ID = "44444444-4444-4444-8444-444444444444";
 const MODEL_ID = "55555555-5555-4555-8555-555555555555";
 const INDEX_ID = "66666666-6666-4666-8666-666666666666";
+const ACTOR_ID = "77777777-7777-4777-8777-777777777777";
 
 describe("Model Registry BFF", () => {
   beforeEach(() => {
@@ -111,6 +112,7 @@ describe("Model Registry BFF", () => {
       `/api/v1/experiments/${EXPERIMENT_ID}/model-registry/candidates`,
       expect.objectContaining({
         body: payload,
+        expectedActorId: ACTOR_ID,
         idempotencyKey: "candidate-register-1",
         method: "POST",
         token: TOKEN,
@@ -166,12 +168,22 @@ describe("Model Registry BFF", () => {
     expect(manager.managerRawRequest).toHaveBeenNthCalledWith(
       1,
       `/api/v1/experiments/${EXPERIMENT_ID}/model-registry/entries/${ENTRY_ID}/promote`,
-      expect.objectContaining({ body: promotePayload, idempotencyKey: "promote-1", method: "POST" }),
+      expect.objectContaining({
+        body: promotePayload,
+        expectedActorId: ACTOR_ID,
+        idempotencyKey: "promote-1",
+        method: "POST",
+      }),
     );
     expect(manager.managerRawRequest).toHaveBeenNthCalledWith(
       2,
       `/api/v1/experiments/${EXPERIMENT_ID}/model-registry/entries/${ENTRY_ID}/revoke`,
-      expect.objectContaining({ body: revokePayload, idempotencyKey: "revoke-1", method: "POST" }),
+      expect.objectContaining({
+        body: revokePayload,
+        expectedActorId: ACTOR_ID,
+        idempotencyKey: "revoke-1",
+        method: "POST",
+      }),
     );
   });
 
@@ -349,6 +361,30 @@ describe("Model Registry BFF", () => {
       400,
       401,
       400,
+    ]);
+    expect(manager.managerRawRequest).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing or malformed expected actor before contacting Manager", async () => {
+    const responses = await Promise.all([
+      createCandidate(
+        mutationRequest(`${registryUrl()}/candidates`, candidatePayload(), "actor-missing", {
+          expectedActorId: null,
+        }),
+        experimentContext(),
+      ),
+      createCandidate(
+        mutationRequest(`${registryUrl()}/candidates`, candidatePayload(), "actor-invalid", {
+          expectedActorId: "NOT-A-UUID",
+        }),
+        experimentContext(),
+      ),
+    ]);
+
+    expect(responses.map((response) => response.status)).toEqual([400, 400]);
+    await expect(Promise.all(responses.map((response) => response.json()))).resolves.toEqual([
+      { error: "invalid_expected_actor" },
+      { error: "invalid_expected_actor" },
     ]);
     expect(manager.managerRawRequest).not.toHaveBeenCalled();
   });
@@ -540,12 +576,15 @@ function mutationRequest(
     browserAuthorization?: string;
     contentLength?: string;
     cookie?: boolean;
+    expectedActorId?: string | null;
     forwardedHost?: string;
   } = {},
 ): NextRequest {
   const headers = commonHeaders(options);
   headers.set("Content-Type", "application/json; charset=utf-8");
   headers.set("Idempotency-Key", key);
+  const expectedActorId = options.expectedActorId === undefined ? ACTOR_ID : options.expectedActorId;
+  if (expectedActorId !== null) headers.set("X-RVC-Expected-Actor-ID", expectedActorId);
   if (options.contentLength) headers.set("Content-Length", options.contentLength);
   return new NextRequest(url, {
     body: JSON.stringify(body),
@@ -558,6 +597,7 @@ function rawMutationRequest(body: BodyInit, key: string): NextRequest {
   const headers = commonHeaders({});
   headers.set("Content-Type", "application/json");
   headers.set("Idempotency-Key", key);
+  headers.set("X-RVC-Expected-Actor-ID", ACTOR_ID);
   return new NextRequest(`${registryUrl()}/candidates`, {
     body,
     headers,

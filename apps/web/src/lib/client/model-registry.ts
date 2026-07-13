@@ -146,6 +146,7 @@ export async function registerModelCandidate(
   source: RegistryCandidateSource,
   expectedRegistryRowVersion: number,
   key: string,
+  expectedActorId: string,
 ): Promise<{ value: ModelRegistryMutationResponse; replayed: boolean }> {
   return registryMutation(
     `/bff/experiments/${encodeURIComponent(source.experimentId)}/model-registry/candidates`,
@@ -157,6 +158,7 @@ export async function registerModelCandidate(
     },
     source.experimentId,
     key,
+    expectedActorId,
     201,
   );
 }
@@ -166,6 +168,7 @@ export async function promoteModelRegistryEntry(
   entry: ModelRegistryEntry,
   expectedRegistryRowVersion: number,
   key: string,
+  expectedActorId: string,
 ): Promise<{ value: ModelRegistryMutationResponse; replayed: boolean }> {
   return registryMutation(
     `/bff/experiments/${encodeURIComponent(experimentId)}/model-registry/entries/${encodeURIComponent(entry.id)}/promote`,
@@ -175,6 +178,7 @@ export async function promoteModelRegistryEntry(
     },
     experimentId,
     key,
+    expectedActorId,
     200,
     entry.id,
   );
@@ -186,6 +190,7 @@ export async function revokeModelRegistryEntry(
   expectedRegistryRowVersion: number,
   reasonCode: ModelRegistryRevokeReason,
   key: string,
+  expectedActorId: string,
 ): Promise<{ value: ModelRegistryMutationResponse; replayed: boolean }> {
   if (!revokeReasons.has(reasonCode)) {
     throw new ModelRegistryMutationError(422, "invalid_request");
@@ -199,6 +204,7 @@ export async function revokeModelRegistryEntry(
     },
     experimentId,
     key,
+    expectedActorId,
     200,
     entry.id,
   );
@@ -245,7 +251,7 @@ export function registryErrorMessage(status: number, code = "request_failed"): s
 }
 
 export function registryMutationIsUncertain(error: unknown): boolean {
-  return !(error instanceof ModelRegistryMutationError) || error.status === 502 || error.status === 503;
+  return !(error instanceof ModelRegistryMutationError) || error.status >= 500;
 }
 
 export function registryRevokeReasonLabel(reason: ModelRegistryRevokeReason | null): string {
@@ -273,10 +279,15 @@ async function registryMutation(
   body: unknown,
   experimentId: string,
   key: string,
+  expectedActorId: string,
   expectedStatus: 200 | 201,
   expectedEntryId?: string,
 ): Promise<{ value: ModelRegistryMutationResponse; replayed: boolean }> {
-  if (!canonicalUuid.test(experimentId) || !idempotencyKey.test(key)) {
+  if (
+    !canonicalUuid.test(experimentId) ||
+    !canonicalUuid.test(expectedActorId) ||
+    !idempotencyKey.test(key)
+  ) {
     throw new ModelRegistryMutationError(422, "invalid_request");
   }
   const response = await fetch(path, {
@@ -286,6 +297,7 @@ async function registryMutation(
     headers: {
       "Content-Type": "application/json",
       "Idempotency-Key": key,
+      "X-RVC-Expected-Actor-ID": expectedActorId,
     },
     method: "POST",
   });

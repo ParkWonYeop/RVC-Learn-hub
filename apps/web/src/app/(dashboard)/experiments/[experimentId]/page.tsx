@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { PageHeader } from "@/components/page-header";
 import { ListLimitNotice } from "@/components/list-limit-notice";
 import { isSafeResourceId } from "@/lib/server/bff-security";
+import { requireCurrentUser } from "@/lib/server/auth";
 import { loadExperimentWorkspace } from "@/lib/server/dashboard-data";
 import { JobMatrixBuilder } from "./job-matrix-builder";
 import { SampleComparison } from "./sample-comparison";
@@ -14,7 +15,10 @@ type Props = { params: Promise<{ experimentId: string }> };
 export default async function ExperimentDetailPage({ params }: Props) {
   const { experimentId } = await params;
   if (!isSafeResourceId(experimentId)) notFound();
-  const workspace = await loadExperimentWorkspace(experimentId);
+  const [workspace, currentUser] = await Promise.all([
+    loadExperimentWorkspace(experimentId),
+    requireCurrentUser(),
+  ]);
   if (!workspace) notFound();
 
   return (
@@ -98,9 +102,11 @@ export default async function ExperimentDetailPage({ params }: Props) {
 
       {!workspace.demo ? (
         <ExperimentModelGovernance
+          actorId={currentUser.id}
           comparisonAvailable={!workspace.jobLimitation}
           experimentId={workspace.id}
           jobs={workspace.jobs}
+          key={`${workspace.id}:${currentUser.id}`}
         />
       ) : null}
 

@@ -128,6 +128,11 @@
   idempotency와 keyed fingerprint를 유지한다. 원문 idempotency key, storage URI/object key/upload
   session/raw metadata는 response·audit·operation ledger에 넣지 않는다. Fake, historical NULL,
   미승인 runtime과 canonical byte 불일치는 fail-closed하며 MLflow를 registry 원장으로 사용하지 않는다.
+  Browser의 응답 유실 intent는 최초 actor ID·key·byte-identical body·전체 원장 지문에 함께 결박한다.
+  Initial mutation, GET reconciliation과 같은 요청 재확인 전에 same-origin session identity를 다시
+  확인하고 BFF가 요구하는 `X-RVC-Expected-Actor-ID`를 Manager가 현재 인증 actor와 같은 요청 안에서
+  대조한다. Actor/Experiment가 바뀌면 intent를 폐기하고 page를 remount하며, transport·invalid success와
+  모든 `5xx`는 불명확 결과로 취급해 새 key로 blind retry하지 않는다.
 - **유실 lease 회수**: lease 만료와 Worker offline grace를 모두 확인한 뒤 unfinished
   attempt를 먼저 종료하고 새 attempt를 배정한다. cancel 요청을 자동 재큐잉보다 우선하고,
   자동 회수 상한을 우회하지 않는다.

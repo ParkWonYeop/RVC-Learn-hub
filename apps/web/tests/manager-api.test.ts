@@ -7,13 +7,14 @@ describe("Manager API server transport", () => {
     vi.unstubAllGlobals();
   });
 
-  it("forwards the server bearer and explicit idempotency key as separate fixed headers", async () => {
+  it("forwards bearer, idempotency key and expected actor as separate fixed headers", async () => {
     const fetchMock = vi.fn().mockResolvedValue(Response.json({ ok: true }));
     vi.stubGlobal("fetch", fetchMock);
     vi.stubEnv("API_INTERNAL_URL", "http://api.internal:8000");
 
     await managerRawRequest("/api/v1/admin/users", {
       body: { email: "managed@example.test" },
+      expectedActorId: "77777777-7777-4777-8777-777777777777",
       idempotencyKey: "create-managed-001",
       method: "POST",
       token: "server.jwt.only",
@@ -27,6 +28,9 @@ describe("Manager API server transport", () => {
     expect(init.body).toBe(JSON.stringify({ email: "managed@example.test" }));
     expect(headers.get("Authorization")).toBe("Bearer server.jwt.only");
     expect(headers.get("Idempotency-Key")).toBe("create-managed-001");
+    expect(headers.get("X-RVC-Expected-Actor-ID")).toBe(
+      "77777777-7777-4777-8777-777777777777",
+    );
     expect(headers.get("Content-Type")).toBe("application/json");
   });
 });

@@ -9,11 +9,12 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from rvc_manager_api.models import (
     Artifact,
     ArtifactUploadSession,
+    AuditEvent,
     Experiment,
     ExperimentModelRegistry,
     Job,
@@ -360,7 +361,45 @@ async def test_model_registry_candidate_promote_replay_and_revoke(
         "source_attempt_id": attempt_id,
         "model_artifact_id": model_id,
     }
-    candidate_headers = {**admin_headers, "Idempotency-Key": "registry-candidate-1"}
+    identity = await client.get("/api/v1/auth/me", headers=admin_headers)
+    assert identity.status_code == 200, identity.text
+    actor_id = str(identity.json()["id"])
+    changed_actor = new_id()
+    assert changed_actor != actor_id
+    actor_mismatch = await client.post(
+        f"/api/v1/experiments/{experiment_id}/model-registry/candidates",
+        headers={
+            **admin_headers,
+            "Idempotency-Key": "registry-actor-mismatch",
+            "X-RVC-Expected-Actor-ID": changed_actor,
+        },
+        json=candidate_body,
+    )
+    assert actor_mismatch.status_code == 409, actor_mismatch.text
+    unchanged = await client.get(
+        f"/api/v1/experiments/{experiment_id}/model-registry",
+        headers=admin_headers,
+    )
+    assert unchanged.status_code == 200, unchanged.text
+    assert unchanged.json()["registry_row_version"] == 0
+    assert unchanged.json()["items"] == []
+    async with app.state.database.session_factory() as session:
+        operation_count = await session.scalar(
+            select(func.count()).select_from(ModelRegistryOperation)
+        )
+        registry_audit_count = await session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(AuditEvent.action.like("model_registry.%"))
+        )
+        assert operation_count == 0
+        assert registry_audit_count == 0
+
+    candidate_headers = {
+        **admin_headers,
+        "Idempotency-Key": "registry-candidate-1",
+        "X-RVC-Expected-Actor-ID": actor_id,
+    }
     candidate = await client.post(
         f"/api/v1/experiments/{experiment_id}/model-registry/candidates",
         headers=candidate_headers,

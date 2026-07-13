@@ -73,7 +73,7 @@ describe("Model Registry panel", () => {
     expect(html).toContain('tabindex="-1"');
   });
 
-  it("exposes accessible loading, read-error and conservative uncertain states", () => {
+  it("exposes accessible loading, read-error and same-intent reconciliation states", () => {
     const loading = renderPanel("loading", null);
     const error = renderToStaticMarkup(createElement(ModelRegistryPanel, {
       ...baseProps("error", null),
@@ -81,14 +81,25 @@ describe("Model Registry panel", () => {
       errorCode: "verification_unavailable",
     }));
     const uncertain = renderPanel("uncertain", emptySnapshot());
+    const retryable = renderPanel("retryable", emptySnapshot());
+    const stale = renderPanel("stale", emptySnapshot());
+    const identityChanged = renderPanel("identity_changed", emptySnapshot());
 
     expect(loading).toContain('aria-busy="true"');
     expect(loading).toContain('role="status"');
     expect(error).toContain('role="alert"');
     expect(error).toContain("canonical byte를 현재 재검증할 수 없습니다");
-    expect(uncertain).toContain("새 요청으로 반복하지 마세요");
-    expect(uncertain).toContain("target 상태가 반영됐는지 먼저 확인");
-    expect(uncertain).toContain("원장이 unchanged인 경우에만");
+    expect(uncertain).toContain("idempotency key와 body를 메모리에 보존");
+    expect(uncertain).toContain("원장 재확인");
+    expect(uncertain).not.toContain("disabled");
+    expect(uncertain).not.toContain("window.location.reload");
+    expect(retryable).toContain("version·active pointer·모든 entry가 unchanged");
+    expect(retryable).toContain("같은 요청 재확인");
+    expect(retryable).toContain("보존 요청 폐기");
+    expect(retryable).not.toContain("disabled");
+    expect(stale).toContain("최신 원장 다시 조회");
+    expect(identityChanged).toContain("로그인 사용자가 변경되었습니다");
+    expect(identityChanged).toContain("새 세션으로 페이지 다시 열기");
   });
 });
 
@@ -103,13 +114,18 @@ function baseProps(phase: RegistryPanelPhase, snapshot: ModelRegistrySnapshot | 
     errorStatus: null,
     feedback: null,
     locked: phase !== "ready",
+    onAbandonUnchanged: vi.fn(),
     onCancelCandidate: vi.fn(),
     onPromote: vi.fn(),
+    onReconcile: vi.fn(),
     onRegister: vi.fn(),
     onReload: vi.fn(),
+    onReloadPage: vi.fn(),
+    onRetryUnchanged: vi.fn(),
     onRevoke: vi.fn(),
     pendingAction: null,
     phase,
+    reconciliationLocked: false,
     snapshot,
   };
 }

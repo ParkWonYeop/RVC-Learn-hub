@@ -8,6 +8,7 @@ import type {
 import {
   applyRegistryMutation,
   fetchModelRegistrySnapshot,
+  ModelRegistryMutationError,
   ModelRegistryReadError,
   promoteModelRegistryEntry,
   registerModelCandidate,
@@ -22,6 +23,7 @@ const ATTEMPT_ID = "33333333-3333-4333-8333-333333333333";
 const ENTRY_ID = "44444444-4444-4444-8444-444444444444";
 const MODEL_ID = "55555555-5555-4555-8555-555555555555";
 const INDEX_ID = "66666666-6666-4666-8666-666666666666";
+const ACTOR_ID = "77777777-7777-4777-8777-777777777777";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -107,14 +109,21 @@ describe("model registry client boundary", () => {
       .mockResolvedValueOnce(Response.json(revokedResponse));
     vi.stubGlobal("fetch", fetchMock);
 
-    await registerModelCandidate(candidate, 0, "register-key-1");
-    await promoteModelRegistryEntry(EXPERIMENT_ID, candidateResponse.entry, 1, "promote-key-1");
+    await registerModelCandidate(candidate, 0, "register-key-1", ACTOR_ID);
+    await promoteModelRegistryEntry(
+      EXPERIMENT_ID,
+      candidateResponse.entry,
+      1,
+      "promote-key-1",
+      ACTOR_ID,
+    );
     await revokeModelRegistryEntry(
       EXPERIMENT_ID,
       candidateResponse.entry,
       1,
       "operator_request",
       "revoke-key-1",
+      ACTOR_ID,
     );
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
@@ -133,6 +142,7 @@ describe("model registry client boundary", () => {
     });
     expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get("authorization")).toBeNull();
     expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get("idempotency-key")).toBe("register-key-1");
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get("x-rvc-expected-actor-id")).toBe(ACTOR_ID);
     expect(JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body))).toEqual({
       expected_registry_row_version: 1,
       expected_entry_row_version: 1,
@@ -140,7 +150,7 @@ describe("model registry client boundary", () => {
     });
   });
 
-  it("fails closed on extra BFF fields and classifies only transport/502/503 as uncertain", async () => {
+  it("fails closed on extra BFF fields and classifies transport or any 5xx as uncertain", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({
       ...page([], 0, null, 0),
       storage_uri: "s3://private",
@@ -149,6 +159,9 @@ describe("model registry client boundary", () => {
       expect.objectContaining<Partial<ModelRegistryReadError>>({ status: 502 }),
     );
     expect(registryMutationIsUncertain(new Error("network"))).toBe(true);
+    expect(registryMutationIsUncertain(new ModelRegistryMutationError(500))).toBe(true);
+    expect(registryMutationIsUncertain(new ModelRegistryMutationError(504))).toBe(true);
+    expect(registryMutationIsUncertain(new ModelRegistryMutationError(409))).toBe(false);
   });
 
   it("updates the active pointer without revoking the previous approved entry", () => {

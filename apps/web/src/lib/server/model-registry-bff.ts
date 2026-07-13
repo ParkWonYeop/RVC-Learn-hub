@@ -138,6 +138,7 @@ export async function createModelRegistryCandidate(
     `/api/v1/experiments/${expectedExperimentId}/model-registry/candidates`,
     201,
     guarded.idempotencyKey,
+    guarded.expectedActorId,
     {
       kind: "candidate",
       payload: guarded.payload,
@@ -158,6 +159,7 @@ export async function promoteModelRegistryEntry(
     `/api/v1/experiments/${expectedExperimentId}/model-registry/entries/${expectedEntryId}/promote`,
     200,
     guarded.idempotencyKey,
+    guarded.expectedActorId,
     {
       kind: "promote",
       payload: guarded.payload,
@@ -179,6 +181,7 @@ export async function revokeModelRegistryEntry(
     `/api/v1/experiments/${expectedExperimentId}/model-registry/entries/${expectedEntryId}/revoke`,
     200,
     guarded.idempotencyKey,
+    guarded.expectedActorId,
     {
       kind: "revoke",
       payload: guarded.payload,
@@ -191,7 +194,7 @@ export async function revokeModelRegistryEntry(
 async function guardedMutation<T>(
   request: NextRequest,
   parse: (value: unknown) => T | null,
-): Promise<{ payload: T; idempotencyKey: string } | NextResponse> {
+): Promise<{ payload: T; idempotencyKey: string; expectedActorId: string } | NextResponse> {
   if (!isSameOriginMutation(request)) return bffError("forbidden", 403);
   if (request.headers.has("authorization")) return bffError("invalid_request", 400);
   if (process.env.DASHBOARD_DEMO_MODE === "true") {
@@ -201,6 +204,10 @@ async function guardedMutation<T>(
   if (!idempotencyKey || !idempotencyKeyPattern.test(idempotencyKey)) {
     return bffError("invalid_idempotency_key", 400);
   }
+  const expectedActorId = request.headers.get("x-rvc-expected-actor-id");
+  if (!expectedActorId || !canonicalUuidPattern.test(expectedActorId)) {
+    return bffError("invalid_expected_actor", 400);
+  }
   const body = await readBoundedRequestJson(request, MAX_BODY_BYTES);
   if (!body.ok) {
     return bffError(
@@ -209,7 +216,9 @@ async function guardedMutation<T>(
     );
   }
   const payload = parse(body.value);
-  return payload ? { payload, idempotencyKey } : bffError("invalid_request", 400);
+  return payload
+    ? { payload, idempotencyKey, expectedActorId }
+    : bffError("invalid_request", 400);
 }
 
 async function mutate(
@@ -217,6 +226,7 @@ async function mutate(
   path: `/api/v1/${string}`,
   expectedStatus: 200 | 201,
   idempotencyKey: string,
+  expectedActorId: string,
   mutation: MutationKind,
   expectedExperimentId: string,
 ): Promise<NextResponse> {
@@ -226,6 +236,7 @@ async function mutate(
     "POST",
     mutation.payload,
     idempotencyKey,
+    expectedActorId,
   );
   if (upstream instanceof NextResponse) return upstream;
   if (!upstream.ok) return upstreamError(request, upstream);
@@ -249,12 +260,14 @@ async function requestManager(
   method: "GET" | "POST",
   body?: unknown,
   idempotencyKey?: string,
+  expectedActorId?: string,
 ): Promise<Response | NextResponse> {
   const token = request.cookies.get(SESSION_COOKIE_NAME)?.value;
   if (!token) return bffError("session_required", 401, request);
   try {
     const { response } = await managerRawRequest(path, {
       body,
+      expectedActorId,
       idempotencyKey,
       method,
       signal: request.signal,

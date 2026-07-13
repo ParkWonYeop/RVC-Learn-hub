@@ -36,12 +36,26 @@ IdempotencyKey = Annotated[
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
     ),
 ]
+ExpectedActorId = Annotated[
+    str | None,
+    Header(
+        alias="X-RVC-Expected-Actor-ID",
+        min_length=36,
+        max_length=36,
+        pattern=r"^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$",
+    ),
+]
 
 
 def _private_no_store(response: Response) -> None:
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["Vary"] = "Authorization"
     response.headers["X-Content-Type-Options"] = "nosniff"
+
+
+def _require_expected_actor(actual_actor_id: str, expected_actor_id: str | None) -> None:
+    if expected_actor_id is not None and expected_actor_id != actual_actor_id:
+        raise ModelRegistryConflict("authenticated actor changed; reload before retry")
 
 
 def _raise_registry_error(exc: Exception) -> NoReturn:
@@ -105,8 +119,10 @@ async def create_model_registry_candidate(
     settings: SettingsDep,
     auth: UserAuthDep,
     idempotency_key: IdempotencyKey,
+    expected_actor_id: ExpectedActorId = None,
 ) -> ModelRegistryMutationRead:
     try:
+        _require_expected_actor(auth.user.id, expected_actor_id)
         result, replayed = await create_candidate(
             session,
             cast(StorageAdapter, request.app.state.storage),
@@ -143,8 +159,10 @@ async def promote_model_registry_entry(
     settings: SettingsDep,
     auth: UserAuthDep,
     idempotency_key: IdempotencyKey,
+    expected_actor_id: ExpectedActorId = None,
 ) -> ModelRegistryMutationRead:
     try:
+        _require_expected_actor(auth.user.id, expected_actor_id)
         result, replayed = await promote_entry(
             session,
             cast(StorageAdapter, request.app.state.storage),
@@ -182,8 +200,10 @@ async def revoke_model_registry_entry(
     settings: SettingsDep,
     auth: UserAuthDep,
     idempotency_key: IdempotencyKey,
+    expected_actor_id: ExpectedActorId = None,
 ) -> ModelRegistryMutationRead:
     try:
+        _require_expected_actor(auth.user.id, expected_actor_id)
         result, replayed = await revoke_entry(
             session,
             settings,

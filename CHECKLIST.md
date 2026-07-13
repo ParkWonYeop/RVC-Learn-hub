@@ -203,7 +203,9 @@
   - [x] 동일 TestSet item current-attempt Sample A/B player와 authoritative PCM metric/provenance
   - [x] Experiment description row-version PATCH와 참조 안전 delete 대시보드 UI/BFF
   - [x] real completed Run의 verified model/index candidate 등록과 explicit champion 승인·폐기 원장
-  - [x] model registry same-origin BFF, Fake 차단, checksum/runtime provenance와 응답 유실 UX
+  - [x] model registry same-origin BFF, Fake 차단, checksum/runtime provenance와 응답 유실 뒤
+    actor-bound intent, 전체 원장 applied/unchanged/changed 판별 및 unchanged에서만 같은 key·body
+    명시 재확인 UX
   - [ ] 실제 browser/API Experiment mutation·Sample 비교·model registry response-loss/동시 promotion E2E
   - [ ] 실제 MinIO/S3 대용량 registry 재해시·tamper/outage와 PostgreSQL multi-replica promotion 경쟁
 - [x] cancel/retry와 오류/빈 상태 UX
@@ -349,5 +351,6 @@
   - [x] exact current real attempt, reviewed commit/승인 runtime과 canonical model/index 재검증형 candidate
   - [x] candidate→approved→revoked, active champion 0/1, inactive approved rollback과 no-fallback 상태 원장
   - [x] owner/admin fence, registry/entry CAS, actor-scoped 멱등 원장과 secret/storage-free audit
-  - [x] same-origin BFF/UI, Fake action 차단, checksum/runtime provenance와 uncertain-response 잠금
+  - [x] same-origin BFF/UI, Fake action 차단, checksum/runtime provenance와 actor-bound
+    uncertain-response reconciliation
   - [ ] 실제 PostgreSQL multi-replica 경쟁, MinIO/S3 대용량 재해시·장애와 browser/API 인수

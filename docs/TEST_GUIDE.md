@@ -290,8 +290,9 @@ byte tamper/storage outage/verification slot timeout은 fail-closed해야 하며
 동시 promotion 1승자, active champion 0/1, 이전 approved rollback, terminal revoke와 idempotency replay,
 owner/admin concealment·private no-store가 모두 검증돼야 한다. Web 회귀는 cookie-only same-origin BFF,
 4 KiB exact body, complete pagination/version fence, Fake 후보 action 차단, response-loss/stale 잠금과
-full reload 후 상태 확인을 검증한다. 이 자동 회귀를 실제 browser/API response-loss, PostgreSQL
-다중 replica 경쟁 또는 실제 S3 대용량 전체 재해시 합격으로 확대 해석하지 않는다.
+전체 원장 reconciliation 뒤 unchanged에서만 보존한 같은 key/body 재확인을 검증한다. 이 자동 회귀를
+실제 browser/API response-loss, PostgreSQL 다중 replica 경쟁 또는 실제 S3 대용량 전체 재해시
+합격으로 확대 해석하지 않는다.
 
 Live telemetry와 terminal watermark 경계는 다음으로 집중 확인한다.
 
@@ -1015,8 +1016,16 @@ real attempt가 없으므로 비교표의 Fake 또는 실행 전 Job에 `후보 
 5. 다른 일반 사용자는 Experiment/registry를 404 경계로 보지 못하고 owner/admin만 관리할 수 있는지,
    response와 screenshot에 storage URI, object key, upload session, actor ID가 없는지 확인한다.
 6. Stale row-version 또는 의도적으로 유발한 응답 유실 뒤 새 idempotency key로 같은 mutation을 즉시
-   반복하지 않는다. UI가 잠기고 전체 원장을 다시 읽어 실제 상태를 확인한 뒤에만 다음 작업을
-   허용해야 한다. 이 장애 주입은 production이 아닌 격리 proxy/test 환경에서만 수행한다.
+   반복하지 않는다. 응답 유실 UI에서 `원장 재확인`을 선택하면 mutation POST 없이 전체 원장을 먼저
+   읽어야 한다. Target이 반영됐으면 재전송 없이 성공으로 끝나고, version·active pointer·모든 entry가
+   요청 전과 정확히 같을 때만 `같은 요청 재확인`이 나타나야 한다. 이 버튼은 최초 key와 byte-identical
+   body를 사용해야 한다. 원장이 다른 변경으로 달라졌다면 이전 intent를 폐기하고 최신 상태 검토를
+   요구해야 한다. 이 장애 주입은 production이 아닌 격리 proxy/test 환경에서만 수행한다.
+7. 응답 유실 intent가 열린 상태에서 다른 tab으로 logout한 뒤 다른 admin으로 login한다. 기존 tab은
+   같은 key/body를 새 actor로 보내면 안 되며, 새 actor로 page가 remount되거나 `로그인 사용자가
+   변경되었습니다` gate에서 전체 page reload만 허용해야 한다. Network 기록에서 identity GET은
+   same-origin cookie만 사용하고 `{actor_id}` 외 email/role/token을 browser response에 포함하지 않는지,
+   stale actor header mutation은 Manager `409`이고 Registry version/items가 그대로인지 확인한다.
 
 실제 S3/MinIO 대용량 object 전체 재해시·tamper/outage, 실제 browser/API response-loss와 PostgreSQL
 다중 replica 동시 promotion을 수행하지 못했다면 각각 `BLOCKED`로 남긴다. 자동 fixture `33 passed`를

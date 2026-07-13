@@ -4,6 +4,71 @@
 
 ## 2026-07-13
 
+### Model Registry 응답 유실 same-intent reconciliation과 실제 Manager 브라우저 스모크
+
+**목적과 변경 범위**
+
+- Model Registry candidate 등록·promotion·revoke가 transport 단절, invalid success 또는 임의 `5xx` 응답으로
+  commit 여부가 불명확해지면 기존 UI는 mutation을 잠근 뒤 hard reload만 제공했다. Reload는 최초
+  idempotency key와 body를 잃으므로 Architecture의 “전체 GET 뒤 완전 unchanged에서만 같은 key/body
+  재확인” 계약을 실제로 수행할 수 없었다.
+- `model-registry-reconciliation.ts`를 추가해 mutation 전 source/entry, expected registry/entry
+  version, 최초 key와 전체 public Registry snapshot의 canonical 지문을 메모리에 복제·보존한다.
+  Reconciliation은 POST를 보내지 않고 bounded 전체 Registry GET을 먼저 수행한다. Exact target이
+  반영됐으면 재전송 없이 성공, version·active pointer·권한·total·모든 entry/artifact/provenance가
+  정확히 같으면 `unchanged`, 그 외에는 `changed`로 판정한다. Item 응답 순서만 canonical 정렬해
+  비교하며 field나 row version 하나라도 달라지면 unchanged로 보지 않는다.
+- `unchanged`에서만 사용자가 보존한 동일 intent를 다시 확인할 수 있고 executor는 최초 key와
+  byte-identical JSON body를 그대로 재사용한다. 사용자는 재전송 없이 intent를 폐기할 수도 있다.
+  `changed`는 이전 intent를 폐기하고 최신 원장 검토를 요구한다. Target applied는 다른 원장 변경이
+  함께 있어도 목표 상태가 현재 유지되는 경우에만 성공으로 인정한다. Stale/일반 read 오류도 hard
+  reload 대신 component의 전체 원장 재조회 경로를 사용한다.
+- 보존 intent를 server-render 시점 actor UUID에도 결박했다. Initial mutation, reconciliation GET과
+  same-intent POST 직전에 `/bff/session/identity`가 cookie session의 exact actor ID만 private no-store로
+  투영하고, mutation BFF는 `X-RVC-Expected-Actor-ID`를 필수 검증해 Manager에 전달한다. Manager는 같은
+  요청을 인증한 actor와 다르면 operation 생성 전 `409`로 거부한다. Experiment 또는 actor가 바뀌면
+  component key가 바뀌어 intent를 폐기하며, identity endpoint는 browser Authorization과 email/role/token
+  projection을 거부한다.
+- Checklist, OPS-006/UI-006 추적표와 자동/사용자 시험 문서를 이 흐름에 맞췄다. 실제 transport
+  response-loss 인수와 동시 promotion은 완료 처리하지 않았다.
+
+**변경 파일과 검증**
+
+- 추가: `apps/web/src/lib/client/model-registry-reconciliation.ts`,
+  `apps/web/src/app/bff/session/identity/route.ts`, `apps/web/tests/model-registry-reconciliation.test.ts`,
+  `apps/web/tests/session-identity-bff.test.ts`. 변경: API model registry router/test, Web client/BFF/server
+  transport, Experiment governance/page/panel 회귀, `AGENTS.md`, `CHECKLIST.md`, Architecture/Security,
+  요구 추적표와 자동·사용자·운영 시험 문서.
+- 집중 Web 회귀는 `6 files / 42 tests`, API model registry는 `14 tests`, `npx tsc --noEmit`가 PASS했다.
+  최초 등록을 두 번 실행해 URL, idempotency key와
+  serialized body가 완전히 같은지 확인했고 register/promote/revoke의 applied, 완전 unchanged,
+  unrelated/version/entry 변경 판정, expected-actor 전달·mismatch no-write와 identity exact projection을
+  고정했다. Reconciliation action에 일반 mutation lock을 잘못 적용해 버튼이 disabled되던 중간 회귀도
+  별도 continuity lock과 markup assertion으로 수정했다.
+- 최종 `make check`는 Ruff, mypy `89 source files`, Python `821 passed, 4 deselected`, Web 전체
+  `26 files / 223 tests`, ESLint, Next.js production build/TypeScript와 19개 static page generation,
+  `git diff --check`를 통과했다. Actor mismatch 회귀는 Registry version/items뿐 아니라 operation과
+  `model_registry.*` audit event가 0건인 것도 확인한다.
+- 별도 실제 기능 스모크로 `RVC_STACK_SMOKE_KEEP=1 bash tests/infra/manager_full_stack_smoke.sh`를
+  실행해 API/Web/PostgreSQL/Redis/MinIO/MLflow/RQ/proxy 전체 Compose가
+  `Manager full Compose stack smoke: PASS (docker_architecture=arm64)`로 준비됨을 확인했다. 임시
+  admin을 password-file로 bootstrap한 뒤 in-app browser에서 로그인, Overview와 Dataset 화면을
+  실제 렌더했다. 390×844 viewport에서 Dataset upload disclosure의 입력이 viewport 안에 있고 문서
+  가로 overflow가 없음을 확인했다. 브라우저 세션을 finalize하고 test 전용 container/network/volume/
+  local image와 임시 password/work root를 정리했다.
+
+**남은 위험**
+
+- Browser 제어 API에 file input 주입 기능이 없어 실제 ZIP 선택부터 MinIO PUT/finalize까지는 이번
+  스모크에서 수행하지 못했다. 실제 browser↔MinIO 대용량/CORS, keyboard·screen-reader와 Dataset
+  per-file 화면 인수는 계속 미완료다.
+- Registry response-loss는 pure/client 회귀로 exact same-intent 경계를 검증했지만 실제 proxy 장애
+  주입, 두 browser tab과 PostgreSQL multi-replica promotion 경쟁, MinIO 대용량 rehash/tamper/outage는
+  아직 실행하지 않았다. 보존 intent는 raw key를 durable browser storage에 남기지 않도록 현재 tab의
+  component memory에만 있으므로 사용자가 tab을 닫거나 수동 hard reload하면 복구 intent는 사라진다.
+- Compose 스모크는 arm64 host의 amd64 image emulation과 development HTTP다. Clean Ubuntu,
+  production 외부 TLS/browser와 실제 NVIDIA/RVC runtime 합격 증거가 아니다.
+
 ### Worker 2단계 self-contained candidate factory와 stable no-clobber 게시
 
 **목적과 변경 범위**

@@ -39,7 +39,11 @@
 - Model registry read/mutation도 Experiment owner 또는 admin만 허용하고 타 소유자, 다른
   Experiment의 Job/attempt/Artifact와 entry ID를 모두 같은 `404`로 숨긴다. Mutation은
   Experiment write fence 뒤 active actor와 token version을 다시 확인하고 registry/entry
-  row-version CAS를 적용한다.
+  row-version CAS를 적용한다. Browser BFF는 server-render 시점 actor와 현재 cookie session을
+  private no-store `/bff/session/identity`의 exact actor ID로 대조하고 canonical
+  `X-RVC-Expected-Actor-ID`를 Manager에 전달한다. Manager는 인증 actor가 달라졌으면 operation을
+  만들기 전에 `409`로 닫는다. Identity endpoint는 email·role·token을 투영하거나 browser가 넣은
+  Authorization을 받지 않는다.
 - 관리자 사용자 생성·역할/활성 변경·비밀번호 재설정은 admin 전용 고정 API와 16 KiB body
   상한을 사용한다. Mutation은 actor별 hash된 idempotency key와 keyed request fingerprint,
   target row version으로 보호하고 응답/audit/멱등 원장에 비밀번호·hash를 저장하지 않는다.
@@ -206,7 +210,9 @@
   runtime provenance만 포함하고 URI, key, upload session과 raw metadata를 제거한다.
 - Registry mutation의 원문 idempotency key는 SHA-256 hash로만 식별하고 request body/path/resource는
   JWT-secret keyed fingerprint에 결박한다. 같은 actor/key의 다른 요청은 `409`, exact replay는 저장한
-  public response snapshot을 반환한다. 새 key를 이용한 blind retry로 승인 row를 중복 생성하지 않는다.
+  public response snapshot을 반환한다. Browser는 actor ID·최초 key·byte-identical body·사전 원장
+  지문을 하나의 in-memory intent로 유지하고 actor/Experiment 변경 시 폐기한다. Transport, invalid
+  success와 모든 `5xx` 뒤 새 key를 이용한 blind retry로 승인 row를 중복 생성하지 않는다.
 - guarded `native` Worker는 source root를 절대 경로로 제한하고 reviewed commit을 설정으로
   바꾸지 못하게 한다. 생성과 claim 직전에 strict asset manifest의 모든 size/SHA-256/mode를
   확인하며 training/RMVPE GPU ID를 새로 수집한 visible capability와 대조한다. mismatch 또는

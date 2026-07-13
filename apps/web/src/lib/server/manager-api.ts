@@ -32,6 +32,7 @@ export interface ManagerRawRequestOptions extends ManagerRequestOptions {
   range?: string;
   ifRange?: string;
   idempotencyKey?: string;
+  expectedActorId?: string;
   redirect?: RequestRedirect;
   signal?: AbortSignal;
   timeoutMs?: number | null;
@@ -76,6 +77,7 @@ export async function managerRawRequest(
   if (options.range) headers.set("Range", options.range);
   if (options.ifRange) headers.set("If-Range", options.ifRange);
   if (options.idempotencyKey) headers.set("Idempotency-Key", options.idempotencyKey);
+  if (options.expectedActorId) headers.set("X-RVC-Expected-Actor-ID", options.expectedActorId);
 
   const timeoutMs = options.timeoutMs === undefined ? 10_000 : options.timeoutMs;
   const timeoutSignal = timeoutMs === null ? null : AbortSignal.timeout(timeoutMs);

@@ -15,7 +15,14 @@ import {
   type RegistryCandidateSource,
 } from "@/lib/client/model-registry";
 
-export type RegistryPanelPhase = "loading" | "ready" | "error" | "stale" | "uncertain";
+export type RegistryPanelPhase =
+  | "loading"
+  | "ready"
+  | "error"
+  | "stale"
+  | "uncertain"
+  | "retryable"
+  | "identity_changed";
 
 export interface RegistryPanelFeedback {
   tone: "status" | "error";
@@ -28,13 +35,18 @@ export function ModelRegistryPanel({
   errorStatus,
   feedback,
   locked,
+  onAbandonUnchanged,
   onCancelCandidate,
   onPromote,
+  onReconcile,
   onRegister,
   onReload,
+  onReloadPage,
+  onRetryUnchanged,
   onRevoke,
   pendingAction,
   phase,
+  reconciliationLocked,
   snapshot,
 }: {
   candidate: RegistryCandidateSource | null;
@@ -42,13 +54,18 @@ export function ModelRegistryPanel({
   errorStatus: number | null;
   feedback: RegistryPanelFeedback | null;
   locked: boolean;
+  onAbandonUnchanged: () => void;
   onCancelCandidate: () => void;
   onPromote: (entry: ModelRegistryEntry) => void;
+  onReconcile: () => void;
   onRegister: (source: RegistryCandidateSource) => void;
   onReload: () => void;
+  onReloadPage: () => void;
+  onRetryUnchanged: () => void;
   onRevoke: (entry: ModelRegistryEntry, reason: ModelRegistryRevokeReason) => void;
   pendingAction: string | null;
   phase: RegistryPanelPhase;
+  reconciliationLocked: boolean;
   snapshot: ModelRegistrySnapshot | null;
 }) {
   const [promoteEntryId, setPromoteEntryId] = useState<string | null>(null);
@@ -108,17 +125,66 @@ export function ModelRegistryPanel({
             onReload={onReload}
             status={errorStatus ?? 502}
           />
-        ) : phase === "stale" || phase === "uncertain" ? (
+        ) : phase === "stale" ? (
           <div className="model-registry-terminal-error" role="alert">
-            <strong>{phase === "uncertain" ? "변경 결과를 확정할 수 없습니다" : "Registry 원장이 변경되었습니다"}</strong>
-            <span>
-              {phase === "uncertain"
-                ? "같은 작업을 새 요청으로 반복하지 마세요. 페이지를 다시 불러온 뒤 target 상태가 반영됐는지 먼저 확인하고, 원장이 unchanged인 경우에만 새 명시적 작업을 시작하세요."
-                : "현재 화면의 row version으로는 추가 작업을 수행할 수 없습니다."}
-            </span>
-            <button className="button button-secondary" onClick={() => window.location.reload()} type="button">
-              최신 페이지 다시 불러오기
+            <strong>Registry 원장이 변경되었습니다</strong>
+            <span>현재 화면의 row version으로는 추가 작업을 수행할 수 없습니다.</span>
+            <button className="button button-secondary" onClick={onReload} type="button">
+              최신 원장 다시 조회
             </button>
+          </div>
+        ) : phase === "identity_changed" ? (
+          <div className="model-registry-terminal-error" role="alert">
+            <strong>로그인 사용자가 변경되었습니다</strong>
+            <span>
+              보존한 idempotency intent를 폐기했습니다. 새 세션의 사용자와 권한으로 페이지 전체를
+              다시 확인하기 전에는 Registry mutation을 보내지 않습니다.
+            </span>
+            <button className="button button-secondary" onClick={onReloadPage} type="button">
+              새 세션으로 페이지 다시 열기
+            </button>
+          </div>
+        ) : phase === "uncertain" ? (
+          <div className="model-registry-terminal-error" role="alert">
+            <strong>변경 결과를 확정할 수 없습니다</strong>
+            <span>
+              최초 요청의 idempotency key와 body를 메모리에 보존했습니다. 새 요청이나 재전송 전에
+              전체 Registry를 읽어 target 상태와 요청 전 원장 지문을 확인합니다.
+            </span>
+            <button
+              className="button button-secondary"
+              disabled={reconciliationLocked || pendingAction !== null}
+              onClick={onReconcile}
+              type="button"
+            >
+              {pendingAction === "reconcile" ? "전체 원장 확인 중…" : "원장 재확인"}
+            </button>
+          </div>
+        ) : phase === "retryable" ? (
+          <div className="model-registry-terminal-error" role="alert">
+            <strong>요청 전 원장과 정확히 같습니다</strong>
+            <span>
+              target 상태가 반영되지 않았고 version·active pointer·모든 entry가 unchanged입니다.
+              보존한 같은 key·같은 body만 재확인하거나, 요청을 전송하지 않고 폐기하세요.
+            </span>
+            <div className="model-registry-confirm-actions">
+              <button
+                className="button button-secondary"
+                disabled={reconciliationLocked || pendingAction !== null}
+                onClick={onRetryUnchanged}
+                type="button"
+              >
+                {pendingAction?.startsWith("retry:") ? "같은 요청 확인 중…" : "같은 요청 재확인"}
+              </button>
+              <button
+                className="button button-ghost"
+                disabled={reconciliationLocked || pendingAction !== null}
+                onClick={onAbandonUnchanged}
+                type="button"
+              >
+                보존 요청 폐기
+              </button>
+            </div>
           </div>
         ) : snapshot ? (
           <div className="model-registry-content">

@@ -189,6 +189,14 @@ request fingerprint를 가진 durable idempotency operation 및 같은 transacti
 snapshot에 포함하지 않는다. MLflow에는 이 원장을 위임하지 않으며 MLflow 장애가 committed registry
 mutation을 되돌리지 않는다.
 
+Browser mutation intent는 server-render 시점의 current actor UUID, 최초 key, byte-identical body와
+mutation 전 전체 public Registry 지문에 결박한다. Initial POST, 응답 유실 뒤 GET reconciliation과
+동일 요청 재확인 직전에 cookie-only same-origin `/bff/session/identity`의 exact `{actor_id}` projection을
+확인한다. Mutation BFF는 canonical `X-RVC-Expected-Actor-ID`를 필수로 받아 Manager에 고정 전달하고,
+Manager는 같은 요청의 인증 actor와 다르면 operation 생성 전에 `409`로 거부한다. Experiment 또는
+actor가 바뀌면 client component key도 바뀌어 보존 intent를 폐기한다. Transport 오류, invalid success
+projection과 모든 `5xx`는 commit 여부가 불명확하므로 새 key로 재전송하지 않는다.
+
 현재 dev.19 partial bundle은 승인된 production runtime digest pair와 실제 GPU qualification이
 없으므로 production candidate가 없는 것이 정상이다. 원장/API/BFF/UI 자동 회귀 통과와 실제 운영
 활성화를 구분하며, 환경 변수나 SQL로 runtime gate를 열어 후보를 만들지 않는다. 실제 S3 대용량
@@ -387,9 +395,11 @@ Worker write 요청은 batch와 idempotency key를 지원한다. 목록 API는 p
 Model registry mutation body는 strict exact-key schema와 bounded raw JSON을 통과하고 모든 요청에
 `Idempotency-Key`가 필요하다. Browser는 same-origin BFF의 고정 endpoint만 호출하며 HttpOnly JWT,
 Manager path, Artifact index 선택 또는 runtime provenance 값을 직접 다루지 않는다. BFF는 public
-allowlist만 투영하고 네트워크 단절·invalid 2xx·`502|503`처럼 commit 여부가 불명확한 mutation을 새
-key로 자동 재전송하지 않는다. Registry GET으로 version/state를 확인한 뒤 완전히 unchanged인 경우에만
-보존한 같은 key와 같은 body의 명시적 재확인을 허용한다.
+allowlist만 투영하고 네트워크 단절·invalid 2xx·모든 `5xx`처럼 commit 여부가 불명확한 mutation을 새
+key로 자동 재전송하지 않는다. 최초 actor와 현재 cookie session을 exact identity BFF로 확인하고,
+browser mutation의 expected actor header를 Manager 인증 actor와 다시 결박한다. Registry GET으로
+version/state를 확인한 뒤 완전히 unchanged인 경우에만 보존한 같은 key와 같은 body의 명시적
+재확인을 허용한다.
 
 Dataset 내부 URI는 사용자 응답에서 숨기며 owner/admin 경계를 적용한다. 삭제는 Dataset
 행을 잠그고 `deleting`을 먼저 commit한 뒤 object를 정리한다. 참조 Experiment/Job과
