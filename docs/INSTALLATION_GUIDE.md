@@ -456,10 +456,13 @@ installers/manager/build-self-contained-release.sh \
 없을 때는 같은 아키텍처의 `docker build --platform linux/amd64`로 내려간 뒤 동일한 실제 image
 platform 검증을 수행한다. arm64 등 다른 아키텍처에서 Buildx가 없으면 legacy builder가 amd64
 중간 image를 안전하게 이어받지 못하므로 archive 생성 전에 실패한다. API/Web/MLflow를
-`linux/amd64`로 build하고 dependency image 다섯
-개를 같은 platform으로 준비한 뒤, 정확히 8개 role의 architecture, image ID, application user와
-version/revision label을 검증해 self-contained archive를 만든다. 현재 checkout은 committed HEAD가
-없으므로 image build 전에 fail-closed하는 것이 정상이다. 또한 upstream base/dependency tag의
+`linux/amd64`로 build하고 dependency image 다섯 개를 Buildx zero-layer target image 또는 native
+amd64 pull로 준비한 뒤, 정확히 8개 role의 architecture, OCI image ID, Docker-save config digest,
+application user와 version/revision label을 검증해 self-contained archive를 만든다. Dependency의
+`Config.User`가 없으면 빈 값으로 처리하지만 API/Web/MLflow user는 각각 `10001:10001`, `nextjs`,
+`10002:10002`를 계속 강제한다. 현재 checkout에는 committed HEAD가 있으므로 clean 상태에서는 source
+gate를 통과하며, 변경 후 commit하지 않은 tree에서는 image build 전에 fail-closed하는 것이 정상이다.
+또한 upstream base/dependency tag의
 immutable digest 고정, 취약점·container·secret scan과 법적 license 검토가 끝나기 전에는 생성된
 archive도 production 승인본이 아니다.
 

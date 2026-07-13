@@ -261,7 +261,8 @@ def test_release_images_receive_version_and_source_commit_labels() -> None:
 
     verifier = (ROOT / "installers/common/image_bundle.py").read_text(encoding="utf-8")
     assert (
-        'user = _validate_image_user(_docker_field(docker, reference, "{{.Config.User}}")'
+        "_docker_field(docker, reference, "
+        "'{{with index .Config \"User\"}}{{.}}{{end}}')"
         in verifier
     )
     assert '("manager", "api"): "10001:10001"' in verifier

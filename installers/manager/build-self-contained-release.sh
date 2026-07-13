@@ -108,8 +108,20 @@ dependency_images=(
   "$nginx_image"
 )
 for reference in "${dependency_images[@]}"; do
-  rvc_log "pulling Manager dependency image for linux/amd64: $reference"
-  docker pull --platform linux/amd64 "$reference"
+  if [[ $build_backend == buildx ]]; then
+    rvc_log "materializing Manager dependency image for linux/amd64: $reference"
+    docker buildx build \
+      --platform linux/amd64 \
+      --pull \
+      --load \
+      --file "$SCRIPT_DIR/dependency-image.Dockerfile" \
+      --tag "$reference" \
+      --build-arg "RVC_DEPENDENCY_IMAGE=$reference" \
+      "$REPO_ROOT"
+  else
+    rvc_log "pulling Manager dependency image for linux/amd64: $reference"
+    docker pull --platform linux/amd64 "$reference"
+  fi
 done
 
 inspect_field() {
@@ -126,7 +138,7 @@ verify_image() {
   image_id=$(inspect_field "$reference" '{{.Id}}')
   operating_system=$(inspect_field "$reference" '{{.Os}}')
   architecture=$(inspect_field "$reference" '{{.Architecture}}')
-  user=$(inspect_field "$reference" '{{.Config.User}}')
+  user=$(inspect_field "$reference" '{{with index .Config "User"}}{{.}}{{end}}')
   [[ $image_id =~ ^sha256:[0-9a-f]{64}$ ]] || \
     rvc_die "container image ID is not a SHA-256 digest for role $role"
   [[ $operating_system == linux && $architecture == amd64 ]] || \

@@ -40,11 +40,11 @@ MANAGER_USERS = {
     "api": "10001:10001",
     "web": "nextjs",
     "mlflow": "10002:10002",
-    "postgres": "postgres",
-    "redis": "redis",
-    "minio": "1000:1000",
+    "postgres": "",
+    "redis": "",
+    "minio": "",
     "minio-client": "",
-    "nginx": "nginx",
+    "nginx": "",
 }
 
 
@@ -133,7 +133,8 @@ if args[:2] == ["image", "inspect"]:
     if meta is None:
         raise SystemExit(2)
     role = meta["role"]
-    image_id = meta["id"]
+    config_id = meta["id"]
+    image_id = "sha256:" + hashlib.sha256(("oci-index:" + config_id).encode()).hexdigest()
     architecture = meta["architecture"]
     labels = dict(meta["labels"])
     if os.environ.get("FAKE_DOCKER_ARCH_ROLE") == role:
@@ -149,11 +150,11 @@ if args[:2] == ["image", "inspect"]:
         print(meta["os"])
     elif template == "{{.Architecture}}":
         print(architecture)
-    elif template == "{{.Config.User}}":
+    elif template == '{{with index .Config "User"}}{{.}}{{end}}':
         print(user)
     elif template == "{{json .RepoTags}}":
         tags = sorted(
-            tag for tag, candidate in state["refs"].items() if candidate["id"] == image_id
+            tag for tag, candidate in state["refs"].items() if candidate["id"] == config_id
         )
         print(json.dumps(tags))
     elif template == "{{json .RepoDigests}}":
@@ -372,6 +373,7 @@ def test_manager_self_contained_bundle_has_exact_versioned_closure(tmp_path: Pat
         assert image["source_reference"] == MANAGER_SOURCES[image["role"]]
         assert image["reference"] == MANAGER_RUNTIME[image["role"]]
         assert image["user"] == MANAGER_USERS[image["role"]]
+        assert image["image_id"] != image["config_digest"]
         if image["role"] in {"api", "web", "mlflow"}:
             assert image["release_labels"] == {
                 "org.opencontainers.image.revision": COMMIT,

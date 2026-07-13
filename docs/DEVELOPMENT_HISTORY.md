@@ -74,6 +74,18 @@
   intermediate image 뒤 `does not provide the specified platform (linux/amd64)`로 중단됐다. Archive는
   게시되지 않았다. 이에 표준 Docker fallback은 daemon architecture가 `amd64|x86_64`일 때만
   허용하고, 다른 host에서는 Buildx 없이는 build/pull/bundle 전에 fail-closed하도록 보정했다.
+- 임시 Docker config와 Homebrew Buildx 0.35.0으로 API/Web/MLflow amd64 image build는 실제
+  완료했다. 그러나 Colima image store에서 `docker pull --platform linux/amd64`한 dependency tag가
+  기존 arm64 variant를 계속 가리켜 PostgreSQL architecture 검사에서 두 번째로 중단됐고 archive는
+  게시되지 않았다. 또한 Buildx-loaded zero-layer image에서 dependency `Config.User` key가 실제로
+  없고, OCI index `.Id`와 Docker-save config digest가 서로 다름을 재현했다.
+- Buildx 경로는 dependency 5개를 target platform zero-layer image로 materialize하도록 바꿨다.
+  Docker inspect는 missing `Config.User`를 빈 값으로 읽되 application user gate를 유지한다.
+  Image closure manifest는 load 전후 OCI identity와 archive의 실제 config byte digest를 별도 필드로
+  결박하며 두 digest의 equality를 더는 잘못 가정하지 않는다.
+- 위 보정 후 Ruff, common image verifier mypy, Manager self-contained/image closure/deployment 집중
+  Pytest, shell syntax와 whitespace 검사를 통과했다. Fake Docker도 dependency user key 부재와
+  image ID/config digest 분리를 기본 fixture로 사용해 회귀를 막는다.
 - 이 변경은 source preflight 한 단계만 복구한다. 실제 linux/amd64 8-image Manager archive 생성,
   dependency image의 비어 있는 `Config.User` inspect 처리, clean Ubuntu 설치와 Worker CUDA/RVC
   runtime qualification은 별도 release gate로 남는다.

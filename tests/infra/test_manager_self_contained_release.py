@@ -28,11 +28,11 @@ IMAGE_USERS = {
     "api": "10001:10001",
     "web": "nextjs",
     "mlflow": "10002:10002",
-    "postgres": "postgres",
-    "redis": "redis",
-    "minio": "1000:1000",
+    "postgres": "",
+    "redis": "",
+    "minio": "",
     "minio-client": "",
-    "nginx": "nginx",
+    "nginx": "",
 }
 
 
@@ -141,11 +141,11 @@ if args[:2] == ["image", "inspect"]:
         "api": "10001:10001",
         "web": "nextjs",
         "mlflow": "10002:10002",
-        "postgres": "postgres",
-        "redis": "redis",
-        "minio": "1000:1000",
+        "postgres": "",
+        "redis": "",
+        "minio": "",
         "minio-client": "",
-        "nginx": "nginx",
+        "nginx": "",
     }
     role = next((key for key, value in sources.items() if value == reference), None)
     if role is None:
@@ -156,7 +156,7 @@ if args[:2] == ["image", "inspect"]:
         print("linux")
     elif template == "{{.Architecture}}":
         print("arm64" if os.environ.get("FAKE_BAD_ARCH_ROLE") == role else "amd64")
-    elif template == "{{.Config.User}}":
+    elif template == '{{with index .Config "User"}}{{.}}{{end}}':
         print("0:0" if os.environ.get("FAKE_BAD_USER_ROLE") == role else users[role])
     elif "org.opencontainers.image.version" in template:
         print("wrong" if os.environ.get("FAKE_BAD_LABEL_ROLE") == role else version)
@@ -218,14 +218,24 @@ def test_release_builder_builds_and_pulls_exact_amd64_closure(tmp_path: Path) ->
         json.loads(line) for line in docker_log.read_text(encoding="utf-8").splitlines()
     ]
     build_commands = [command for command in docker_commands if command[:2] == ["buildx", "build"]]
-    assert len(build_commands) == 3
+    application_build_commands = [
+        command
+        for command in build_commands
+        if not command[command.index("--file") + 1].endswith("dependency-image.Dockerfile")
+    ]
+    dependency_build_commands = [
+        command
+        for command in build_commands
+        if command[command.index("--file") + 1].endswith("dependency-image.Dockerfile")
+    ]
+    assert len(application_build_commands) == 3
     expected_dockerfiles = (
         "apps/api/Dockerfile",
         "apps/web/Dockerfile",
         "infra/mlflow/Dockerfile",
     )
     for command, role, dockerfile in zip(
-        build_commands,
+        application_build_commands,
         ("api", "web", "mlflow"),
         expected_dockerfiles,
         strict=True,
@@ -237,13 +247,18 @@ def test_release_builder_builds_and_pulls_exact_amd64_closure(tmp_path: Path) ->
         assert command[command.index("--file") + 1].endswith(dockerfile)
         assert f"RVC_RELEASE_VERSION={VERSION}" in command
         assert f"RVC_SOURCE_COMMIT={COMMIT}" in command
-    assert "MLFLOW_BASE_IMAGE=ghcr.io/mlflow/mlflow:v3.1.1" in build_commands[2]
+    assert "MLFLOW_BASE_IMAGE=ghcr.io/mlflow/mlflow:v3.1.1" in application_build_commands[2]
 
     pulls = [command for command in docker_commands if command[:1] == ["pull"]]
-    assert pulls == [
-        ["pull", "--platform", "linux/amd64", SOURCE_IMAGES[role]]
-        for role in ("postgres", "redis", "minio", "minio-client", "nginx")
-    ]
+    assert pulls == []
+    dependency_roles = ("postgres", "redis", "minio", "minio-client", "nginx")
+    assert len(dependency_build_commands) == len(dependency_roles)
+    for command, role in zip(dependency_build_commands, dependency_roles, strict=True):
+        assert command[command.index("--platform") + 1] == "linux/amd64"
+        assert "--pull" in command
+        assert "--load" in command
+        assert command[command.index("--tag") + 1] == SOURCE_IMAGES[role]
+        assert f"RVC_DEPENDENCY_IMAGE={SOURCE_IMAGES[role]}" in command
 
     expected_bundle_arguments = [
         "--version",
@@ -296,7 +311,10 @@ def test_release_builder_requires_buildx_for_cross_architecture_build(
         FAKE_DOCKER_ARCHITECTURE="aarch64",
     )
     assert result.returncode != 0
-    assert "Docker Buildx is required to cross-build linux/amd64 images from aarch64" in result.stderr
+    assert (
+        "Docker Buildx is required to cross-build linux/amd64 images from aarch64"
+        in result.stderr
+    )
     commands = [
         json.loads(line) for line in docker_log.read_text(encoding="utf-8").splitlines()
     ]
@@ -344,7 +362,19 @@ def test_release_builder_rejects_platform_user_or_label_mismatch_before_bundle(
 def test_release_builder_stops_when_dependency_pull_fails(tmp_path: Path) -> None:
     result, _, _, bundle_args = _run(
         tmp_path,
+        FAKE_BUILDX_MISSING="1",
         FAKE_PULL_FAIL_REFERENCE=SOURCE_IMAGES["minio"],
+    )
+    assert result.returncode != 0
+    assert not bundle_args.exists()
+
+
+def test_release_builder_stops_when_dependency_materialization_fails(
+    tmp_path: Path,
+) -> None:
+    result, _, _, bundle_args = _run(
+        tmp_path,
+        FAKE_BUILD_FAIL_REFERENCE=SOURCE_IMAGES["minio"],
     )
     assert result.returncode != 0
     assert not bundle_args.exists()

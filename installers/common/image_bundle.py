@@ -474,7 +474,9 @@ def _docker_config_user(raw: bytes, path: Path) -> str:
     return _validate_image_user(config.get("User", ""), "archive")
 
 
-def _verify_docker_save_archive(path: Path, expected_images: list[dict[str, Any]]) -> None:
+def _verify_docker_save_archive(
+    path: Path, expected_images: list[dict[str, Any]] | None
+) -> dict[str, str]:
     manifest_raw: bytes | None = None
     member_names: set[str] = set()
     regular_members: set[str] = set()
@@ -515,8 +517,13 @@ def _verify_docker_save_archive(path: Path, expected_images: list[dict[str, Any]
     if not isinstance(manifest, list) or len(manifest) > 1024:
         _fail(f"Docker image archive manifest must be a bounded array: {path.name}")
 
-    expected_by_reference = {item["reference"]: item for item in expected_images}
+    expected_by_reference = (
+        {item["reference"]: item for item in expected_images}
+        if expected_images is not None
+        else None
+    )
     actual_references: set[str] = set()
+    config_digests_by_reference: dict[str, str] = {}
     actual_configs: set[str] = set()
     layer_members: set[str] = set()
     for index, entry in enumerate(manifest):
@@ -559,14 +566,16 @@ def _verify_docker_save_archive(path: Path, expected_images: list[dict[str, Any]
             if reference in actual_references:
                 _fail(f"Docker image archive has a duplicate RepoTag: {reference}")
             actual_references.add(reference)
-            expected = expected_by_reference.get(reference)
-            if expected is None:
-                _fail(f"Docker image archive has an unexpected RepoTag: {reference}")
-            if expected["config_digest"] != config_digest:
-                _fail(f"Docker image archive Config digest differs for {reference}")
-            if expected["user"] != config_user:
-                _fail(f"Docker image archive Config user differs for {reference}")
-    if actual_references != set(expected_by_reference):
+            config_digests_by_reference[reference] = config_digest
+            if expected_by_reference is not None:
+                expected = expected_by_reference.get(reference)
+                if expected is None:
+                    _fail(f"Docker image archive has an unexpected RepoTag: {reference}")
+                if expected["config_digest"] != config_digest:
+                    _fail(f"Docker image archive Config digest differs for {reference}")
+                if expected["user"] != config_user:
+                    _fail(f"Docker image archive Config user differs for {reference}")
+    if expected_by_reference is not None and actual_references != set(expected_by_reference):
         missing = ",".join(sorted(set(expected_by_reference) - actual_references)) or "none"
         _fail(f"Docker image archive is missing expected RepoTags: {missing}")
     config_like_members = {
@@ -574,6 +583,7 @@ def _verify_docker_save_archive(path: Path, expected_images: list[dict[str, Any]
     } - layer_members
     if config_like_members != actual_configs:
         _fail(f"Docker image archive Config inventory differs: {path.name}")
+    return config_digests_by_reference
 
 
 def _docker_field(docker: str, reference: str, template: str) -> str:
@@ -619,7 +629,10 @@ def _inspect_image(
     image_id = _docker_field(docker, reference, "{{.Id}}")
     operating_system = _docker_field(docker, reference, "{{.Os}}")
     architecture = _docker_field(docker, reference, "{{.Architecture}}")
-    user = _validate_image_user(_docker_field(docker, reference, "{{.Config.User}}"), role)
+    user = _validate_image_user(
+        _docker_field(docker, reference, '{{with index .Config "User"}}{{.}}{{end}}'),
+        role,
+    )
     references = _docker_string_list(docker, reference, "RepoTags")
     references.extend(_docker_string_list(docker, reference, "RepoDigests"))
     if reference not in references:
@@ -776,8 +789,6 @@ def _validate_manifest(
             _fail(f"invalid image ID for role {role}")
         if not isinstance(config_digest, str) or not DIGEST_RE.fullmatch(config_digest):
             _fail(f"invalid config digest for role {role}")
-        if image_id != config_digest:
-            _fail(f"Docker image ID/config digest mismatch for role {role}")
         if image_id in image_ids or config_digest in config_digests:
             _fail(f"duplicate container image content for role {role}")
         image_ids.add(image_id)
@@ -866,10 +877,20 @@ def _create(args: argparse.Namespace) -> None:
             for role, source_reference, reference, archive in specs
         ]
         archive_items: list[dict[str, Any]] = []
+        config_digests_by_archive: dict[str, dict[str, str]] = {}
         for archive in sorted({item["archive"] for item in images}):
             _, local_path = _validate_relative_archive_path(root, archive)
             sha256, size = _hash_regular_file(local_path)
             archive_items.append({"path": archive, "sha256": sha256, "size": size})
+            config_digests_by_archive[archive] = _verify_docker_save_archive(
+                local_path,
+                None,
+            )
+        for item in images:
+            config_digest = config_digests_by_archive[item["archive"]].get(item["reference"])
+            if config_digest is None:
+                _fail(f"Docker image archive is missing expected RepoTag: {item['reference']}")
+            item["config_digest"] = config_digest
         document = {
             "format_version": FORMAT_VERSION,
             "component": args.component,
@@ -956,6 +977,10 @@ def _verify_loaded(args: argparse.Namespace) -> None:
             expected["archive"],
             verify_source=False,
         )
+        # On containerd image stores, Docker exposes an OCI index digest as .Id while
+        # docker save carries the image config digest separately. Matching .Id binds
+        # the loaded index; archive verification already binds the config bytes.
+        actual["config_digest"] = expected["config_digest"]
         if actual != expected:
             _fail(f"loaded container image differs for role {expected['role']}")
 

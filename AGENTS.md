@@ -323,7 +323,13 @@
   `runtime` 정확히 1개의 linux/amd64 image만 허용한다. Docker-save archive와 strict
   `images-manifest.json`의 archive hash/size, source/runtime reference, image/config digest,
   OS/architecture와 application release label을 load 전후에 검증한다. Manager dependency
-  image는 rollback tag overwrite를 막는 version-scoped `rvc-orchestrator-<role>:<version>`
+  image의 `Config.User` key가 없으면 빈 값으로 정규화하되 application user 검증은 완화하지 않는다.
+  Containerd image store의 OCI index `.Id`와 Docker-save config byte digest는 정상적으로 다를 수
+  있으므로 둘을 각각 기록·검증하고 단순 equality를 강제하지 않는다.
+  Cross-architecture Buildx release는 dependency source tag도 target platform의 zero-layer image로
+  materialize한 뒤 실제 architecture를 검사한다. `docker pull --platform` 출력만으로 target tag의
+  local platform을 증명하지 않는다. Manager dependency image는 rollback tag overwrite를 막는
+  version-scoped `rvc-orchestrator-<role>:<version>`
   alias로만 실행하고 self-contained Compose는 `RVC_IMAGE_PULL_POLICY=never`를 사용한다.
   install/upgrade/start/restart/rollback은 installed manifest·env·현재 loaded identity를 다시
   검증하기 전 release를 활성화하지 않는다. partial bundle은 `SELF_CONTAINED=false`와 빈 v2
