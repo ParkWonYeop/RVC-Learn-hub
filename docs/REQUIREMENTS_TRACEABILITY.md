@@ -13,7 +13,7 @@
 | SYS-003 | 같은 Dataset을 여러 조건으로 병렬 학습한다. | 한 Experiment 안에 여러 immutable JobConfig를 생성하고 독립 실행한다. | Verified — 동일 Dataset/Experiment의 PM·Harvest·RMVPE 세 Job을 세 Agent가 겹치는 attempt로 독립 완료 |
 | SYS-004 | PostgreSQL을 metadata 원장으로 사용한다. | 재시작 후 사용자·Worker·Dataset·Job·Artifact 관계와 상태가 보존된다. | Planned |
 | SYS-005 | Redis/RQ를 중앙 내부 비동기 작업에 사용한다. | Dataset 검증/정리 task가 API process와 분리되어 실행되고 장애 상태가 노출된다. | Partial — Dataset/TestSet staging cleanup RQ Worker, task-aware DB ledger/claim, dequeue+perform/enqueue exact JSON policy, execution-material poison quarantine, bounded retry, queue-loss reconciler와 readiness 검증; maintenance 전용 PostgreSQL column/function role, staging delete-only MinIO identity, exact RQ Redis ACL과 long-operation CAS heartbeat를 실제 PostgreSQL 16/Redis 7.4/MinIO/Compose에서 검증. Dataset finalize/검증 RQ 전환과 실제 다중 replica·외부 S3/Redis/PostgreSQL restart/partition 장애 주입은 대기 |
-| SYS-006 | MinIO/S3에 대형 Dataset과 Artifact를 저장한다. | upload/finalize/checksum/download와 exact namespace mismatch 통합 테스트가 통과한다. | Verified — backend+credential 없는 namespace snapshot, 다른 root/bucket fail-closed와 credential rotation 동일성, Manager/MLflow identity의 상대 bucket 거부와 broad-policy 재실행 제거 smoke 검증 |
+| SYS-006 | MinIO/S3에 대형 Dataset과 Artifact를 저장한다. | upload/finalize/checksum/download와 exact namespace mismatch 통합 테스트가 통과한다. | Verified — backend+credential 없는 namespace snapshot, 다른 root/bucket fail-closed와 credential rotation 동일성, exact `If-None-Match: *` Manager→Worker 계약, ACK 유실 후 finalize, deterministic cleanup key와 Mock S3 first/confirmation delete, Manager/MLflow identity의 상대 bucket 거부와 broad-policy 제거를 자동 검증. 실제 장기 MinIO/S3 PUT·outage cleanup 장애 주입은 release gate |
 | SYS-007 | MLflow에 parameter, metric, artifact link를 투영한다. | MLflow 장애가 원장 Job을 손상하지 않고 재동기화할 수 있다. | Verified — durable outbox/replay와 fail-open/closed 회귀, UID 10002 read-only health 및 root source→전용 runtime secret actual-entrypoint smoke 포함 |
 | SYS-008 | 실시간 로그와 상태를 제공한다. | sequence 기반 SSE/WebSocket 재연결 테스트가 통과한다. | Verified |
 
@@ -23,7 +23,7 @@
 |---|---|---|---|
 | API-001 | API는 versioned `/api/v1` 경로를 제공한다. | OpenAPI에 모든 외부 endpoint가 prefix 아래 표시된다. | Verified |
 | API-002 | User, Worker, Dataset, Experiment, Job을 저장한다. | migration과 관계/constraint 통합 테스트가 통과한다. | Verified — Dataset/Artifact historical session은 `UNBOUND` sentinel, 신규 행은 exact namespace가 필수; Dataset PCM aggregate all-null/all-present·bounds와 historical null 보존; Experiment immutable name/Dataset, description row-version CAS, 참조·MLflow 안전 삭제와 historical duplicate 보존; SQLite/PostgreSQL upgrade+downgrade 검증 |
-| API-003 | Log, Metric, Artifact, Sample, Preset metadata를 저장한다. | 중복 key/idempotency와 pagination 테스트가 통과한다. | Verified — log/metric sequence와 canonical payload fingerprint 충돌, terminal exclusive watermark의 bounded late replay, Sample 등록/replay/list/download, composite graph와 native/runtime provenance 교차검증 포함 |
+| API-003 | Log, Metric, Artifact, Sample, Preset metadata를 저장한다. | 중복 key/idempotency와 pagination 테스트가 통과한다. | Verified — log/metric sequence와 canonical payload fingerprint 충돌, terminal exclusive watermark의 bounded late replay, Artifact writer/finalizer/cleanup UUID ownership과 response-loss finalize, Sample 등록/replay/list/download, composite graph와 native/runtime provenance 교차검증 포함 |
 | API-004 | 재시도마다 JobAttempt를 분리 보존한다. | retry가 이전 로그·metric·artifact를 덮어쓰지 않는다. | Verified |
 | API-005 | 모든 상태 전이를 append-only event로 추적한다. | 잘못된 전이를 거부하고 event sequence가 연속적이다. | Verified |
 | API-006 | Worker 배정은 atomic lease다. | 동시 claim에서 한 Worker만 성공하고 stale lease write가 거부된다. | Verified |
@@ -48,11 +48,11 @@
 
 | ID | 요구사항 | 인수 조건 | 상태 |
 |---|---|---|---|
-| JOB-001 | JobConfig는 배정 후 immutable snapshot이다. | canonical JSON hash가 저장되고 실행 중 수정 API가 없다. | Partial |
+| JOB-001 | JobConfig는 배정 후 immutable snapshot이다. | canonical JSON hash가 저장되고 실행 중 수정 API가 없다. | Verified — 기본값과 JSONB-stable signed zero를 포함한 canonical UTF-8 JSON SHA-256을 Job 생성 transaction에 저장하고 raw/정규화 hash와 Job 핵심 컬럼을 claim/read에서 대조한다. 공개 Job 목록·상세도 current attempt가 있으면 exact `JobAttempt`의 Job ID/hash를 검증해 누락·NULL·불일치 시 config/engine projection 전체를 409로 닫는다. 새 attempt·Worker claim·Agent workspace 전 검증뿐 아니라 retry/recovery, active lease, terminal/telemetry, Artifact/Sample final fence, comparison/MLflow projection도 exact attempt hash에 결박한다. JSON/hash 변조는 격리되고 historical NULL은 claim limit 전 제외되며 retry/registry에 쓰지 않는다. `a7c4e9f2b610`은 과거 hash를 추정 backfill하지 않는다. |
 | JOB-002 | 상태 목록은 원문 정의를 지원한다. | enum과 전이표가 queued부터 terminal까지 contract test를 통과한다. | Verified |
 | JOB-003 | `use_f0=false`이면 F0 단계를 생략한다. | 상태와 command plan 모두 extracting_f0를 포함하지 않는다. | Verified |
 | JOB-004 | optional index/sample 단계는 config에 따라 생략한다. | 각 조합의 전이 테스트가 통과한다. | Verified |
-| JOB-005 | `completed`는 필수 Artifact 검증 후에만 허용한다. | model 및 활성화된 index, sample-enabled면 모든 TestSet Sample과 현재 canonical byte가 없으면 완료가 거부된다. | Verified |
+| JOB-005 | `completed`는 필수 Artifact 검증 후에만 허용한다. | model 및 활성화된 index, sample-enabled면 모든 TestSet Sample과 현재 canonical byte가 없으면 완료가 거부된다. | Verified — Worker PUT ACK 유실/409/412는 새 upload로 추정하지 않고 같은 session finalize로 Manager 전체 size/SHA-256 판정을 받으며, terminal/config fence를 통과한 canonical만 원장과 completion 근거가 된다. |
 | JOB-006 | loss와 epoch, GPU 상태를 지속 수집한다. | 중복 batch가 하나의 logical metric으로 저장된다. | Partial — native stdout/train.log/TensorBoard와 시작 직후/60초 GPU·VRAM·온도·disk/availability를 같은 durable sequence로 전송하고 terminal 전 HTTP tail로 loss/epoch/indexed GPU를 조회; 동일 system 시간 표본 보존과 final flush를 fixture/E2E로 검증, 실제 NVIDIA 장시간 정확도·부하 증적 대기 |
 | JOB-007 | sample Job은 게시할 model/index 의미와 일치하는 Artifact 수집을 요구한다. | enabled인데 `collect_samples=false`, `collect_small_model=false`, `index.build_index=false`+nonzero `index_rate`, 또는 nonzero `index_rate`+`collect_index=false` 조합이 계약에서 거부된다. | Verified |
 
@@ -68,7 +68,7 @@
 | WRK-006 | 취소 시 process group을 정상 종료하고 제한 시간 뒤 강제 종료한다. | child process를 남기지 않는 cancel test가 통과한다. | Verified |
 | WRK-007 | 모든 실행 환경과 RVC commit/asset checksum을 기록한다. | `environment.json`과 artifact manifest schema가 검증된다. | Partial — attempt의 approved image/asset digest와 native inference manifest/request hash를 Artifact/Sample까지 기록·재검증하고 49-case release 증적 projection 경계도 구현했지만 실제 GPU 증적 대기 |
 | WRK-008 | Fake runner로 GPU 없는 E2E를 제공한다. | Dataset→Job→Artifact 전체 fake 흐름이 CI에서 통과한다. | Verified |
-| WRK-009 | stage timeout/error와 retry 경계를 명시하고 민감정보 없는 terminal 실패를 보고한다. | 전 stage timeout, no-replay, cancel 우선, Dataset/TestSet/Artifact bounded transfer exhaustion과 redaction test가 통과한다. | Verified |
+| WRK-009 | stage timeout/error와 retry 경계를 명시하고 민감정보 없는 terminal 실패를 보고한다. | 전 stage timeout, no-replay, cancel 우선, Dataset/TestSet/Artifact bounded transfer exhaustion과 redaction test가 통과한다. | Verified — Artifact는 exact conditional header만 수용하고 transport/409/412 ambiguity 뒤 finalize하며 object 부재만 bounded retryable로 처리한다. |
 | WRK-010 | Job snapshot의 고정 TestSet을 lease-bound로 안전하게 수신한다. | capability/method 또는 DB sample-plan hash mismatch는 미배정되고 current Worker/lease/attempt만 item을 받으며, external 307 credential/cookie 비전달, exact response hash/PCM, 전체 디렉터리 atomic/replay 검증이 통과한다. | Verified — 전송/materialization만 해당하며 inference와 Sample completion은 포함하지 않음 |
 
 ## RVC Adapter
@@ -115,7 +115,7 @@
 | SEC-007 | 사용자 권한 변경과 비밀번호 재설정은 기존 세션을 즉시 폐기하고 마지막 관리자를 보존한다. | token version, self/last-admin 보호와 동시 cross-demotion 회귀가 통과한다. | Verified |
 | OPS-001 | Worker offline과 lease 만료를 감지한다. | 장애 E2E에서 중복 실행 없이 복구 정책을 따른다. | Partial |
 | OPS-002 | backup/restore/upgrade/rollback을 제공한다. | clean VM 복구 drill에서 metadata와 object가 일치한다. | Partial — historical namespace 자동 backfill 금지, byte 검증형 adoption과 e2 이전 active Dataset upload의 fail-closed expire/generation replay 구현; production-like pre-upgrade process drain/adoption/rollback drill 대기 |
-| OPS-003 | 사용자/프로젝트 storage quota와 retention을 제공한다. | canonical Dataset/Artifact/Sample 총량 초과와 참조 중 삭제가 거부되고 reclaim이 audit된다. | Partial — upload session count/byte 상한은 구현; 장기 canonical 사용량 quota/retention 대기 |
+| OPS-003 | 사용자/프로젝트 storage quota와 retention을 제공한다. | canonical Dataset/Artifact/Sample 총량 초과와 참조 중 삭제가 거부되고 reclaim이 audit된다. | Partial — upload session count/byte 상한, API-owned Artifact cleanup claim/heartbeat, local single-pass와 S3/canonical confirmed delete 뒤 quota 해제, historical NULL marker 수렴과 production readiness gate 구현; 장기 canonical 사용량 quota/retention과 실제 외부 S3 장애 drill 대기 |
 | OPS-004 | checkpoint resume는 이전 산출물을 섞지 않고 새 attempt로 수행한다. | 검증된 G/D pair만 새 attempt 입력이 되고 원 attempt 원장은 불변이다. | Planned |
 | OPS-005 | terminal Job, Worker offline과 quota 알림을 보낸다. | outbox replay에도 사용자당 한 logical notification만 전달된다. | Planned |
 | OPS-006 | 승인 가능한 model registry를 제공한다. | exact current real attempt의 reviewed commit과 승인 runtime provenance, canonical model/index 재해시를 통과한 candidate만 등록되고 candidate/approved/revoked, active champion 0/1, rollback promotion과 revoke가 CAS·멱등 원장·audit로 보존된다. | Partial — PostgreSQL 원장, owner/admin CAS·actor-scoped hashed idempotency·audit API와 same-origin BFF/UI를 구현했다. Candidate 생성/promotion의 canonical byte 재해시, Fake/historical NULL/unapproved runtime 차단, active champion 0/1·inactive approved rollback·revoke terminal을 검증했고, Web은 응답 불명확 시 actor ID·최초 key/body·전체 사전 원장 지문을 메모리에 보존해 GET으로 applied/완전 unchanged/changed를 구분한 뒤 unchanged에서만 같은 요청을 명시적으로 재확인한다. Identity BFF와 Manager expected-actor fence는 계정 전환 시 intent를 폐기하고 operation 전 `409`로 닫는다. 실제 PostgreSQL multi-replica 경쟁, MinIO/S3 대용량 재해시·tamper/outage와 실제 browser/API account switch·response-loss 인수는 대기. MLflow는 계속 파생 projection이며 registry 원장이 아님 |

@@ -198,7 +198,25 @@
   Manager 상대 path만 제공한다. 수신 파일은 `O_NOFOLLOW` mode `0600` partial에 쓰고
   fsync/원자 게시하며 canonical ZIP도 traversal, symlink, duplicate, CRC와 bomb를 다시
   검사한 뒤 workspace flat directory로 게시한다.
-- JobConfig canonical JSON hash, RVC commit, adapter profile, image digest, Python/CUDA/PyTorch와 asset checksum을 기록한다.
+- JobConfig는 기본값 포함 정규화 JSON의 canonical SHA-256을 Job, exact attempt와 Worker claim에 같은
+  값으로 기록하며 signed zero를 JSONB-stable `0.0`으로 정규화한다. Manager는 raw/정규화 hash와 Job
+  컬럼을 claim/retry/model registry, active lease mutation, terminal/Artifact/Sample 최종 fence,
+  comparison/MLflow projection 및 hash가 있는 신규 row 조회에서 fail-closed 대조하고 Worker는 wire
+  parse와 workspace 생성 전에 재검증한다. Artifact local writer token/heartbeat와 seal CAS는 동시 PUT을
+  하나로 제한하고 S3는 exact `If-None-Match: *`만 허용한다. Worker는 transport 오류, local `409`, S3
+  `412` 뒤 같은 session finalize를 사용해 Manager 검증으로 수렴한다. Canonical publish는 별도 UUID
+  finalization token과 heartbeat로 소유권을 유지하며 exact token의 terminal CAS 전에는 object를
+  정리하지 않는다. 이후 API reconciler는 RQ maintenance credential을 확장하지 않고 별도 cleanup
+  token을 사용한다. Job/attempt/type/session에서 재구성한 key와 stored key가 다르면 어떤 object도
+  삭제하지 않으며, S3 staging/실패 canonical은 first-delete와 confirmation-delete를 모두 통과해야
+  cleanup 완료와 quota 해제가 가능하다. Production API는 이 reconciler를 비활성화할 수 없다.
+  Sample 최종 원장은 SQLite에서도 실효적인 Job write fence 뒤
+  전체 claim/config를 재검증한다.
+  Historical NULL Job은 history-only 조회만 허용하며 claim/retry/registry에는 사용할 수 없다. NULL을 현재
+  설정으로 backfill하거나 hash만 바꿔 attempt provenance를 재작성하지 않는다. NULL queued row는 claim
+  후보에서 제외하고 non-NULL corrupt row는 sanitized failure/audit로 격리하며 corrupt attempt를 자동
+  재큐잉하지 않는다. RVC commit, adapter
+  profile, image digest, Python/CUDA/PyTorch와 asset checksum도 함께 기록한다.
 - Model registry candidate는 exact current completed real attempt의 `worker-claim-v1` snapshot,
   reviewed commit과 승인된 runtime image/asset pair가 모두 있을 때만 생성한다. 과거 attempt를
   현재 Worker row나 환경 설정으로 추정 backfill하지 않는다. Model은 Manager-verified
@@ -311,7 +329,7 @@
 - Model registry의 candidate/promotion/revoke API와 same-origin BFF는 구현·자동 회귀 뒤에도 실제
   browser/API의 response-loss 재조정, PostgreSQL 다중 replica 동시 promotion, MinIO/S3 대용량
   canonical 전체 재해시·timeout·byte 변조·outage와 keyboard/screen-reader 인수가 별도 release
-  gate다. Runtime qualification이 닫힌 현재 dev.18 partial
+  gate다. Runtime qualification이 닫힌 현재 dev.20 partial
   bundle에서는 승인 digest pair가 없으므로 실제 production candidate가 0인 것이 기대 상태이며,
   환경변수로 이 gate를 우회해 registry 기능을 시연하지 않는다.
 - Dataset finalize는 bounded thread에서 동기 실행한다. entry/byte/압축률 상한은

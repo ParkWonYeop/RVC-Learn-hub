@@ -50,6 +50,29 @@
   두 identity가 상대 bucket을 읽고 쓰게 해서는 안 된다. Init 재실행은 broad policy를 제거하고
   exact policy attachment를 다시 검증해야 한다.
 - **인증 분리**: 사용자 JWT와 Worker별 토큰은 별도 인증 흐름과 권한을 사용한다. 원문 토큰이나 비밀번호를 DB/로그에 저장하지 않는다.
+- **JobConfig immutable snapshot**: 신규 Job은 기본값까지 채운 `JobConfig.model_dump(mode="json")`의
+  canonical UTF-8 JSON과 SHA-256을 같은 transaction에 저장한다. Claim 전에는 저장 raw JSON 해시,
+  정규화 모델 해시, Job 핵심 컬럼과 저장 해시가 모두 같아야 하며 새 attempt와 Worker claim에는 같은
+  해시를 복제한다. Canonical number는 JSONB 왕복에서 부호가 사라지는 `-0.0`을 `0.0`으로 접는다.
+  Worker는 wire validation 뒤 workspace 생성 전에 다시 해시한다. Active lease의 heartbeat/renew/input
+  download/status/telemetry/artifact/sample과 긴 검증의 최종 write fence도 exact Job/attempt hash를
+  다시 확인한다. Artifact local PUT은 UUID writer token·heartbeat·절대 만료와 단일 seal CAS를
+  유지한다. S3 PUT은 exact `If-None-Match: *`만 허용하고 Worker는 transport 오류, sealed local `409`,
+  conditional S3 `412` 뒤 새 PUT을 만들지 않고 같은 session finalize로 Manager의 전체 byte 검증을
+  받아야 한다. Artifact finalize는 별도 UUID 소유권 token과 DB heartbeat를 유지하며 token CAS를
+  먼저 terminal로 commit한 소유자만 원장을 확정한다. API-owned cleanup reconciler는 RQ maintenance
+  identity를 재사용하지 않고 별도 cleanup token을 claim한다. 삭제 전 Job/attempt/type/session ID로
+  staging/canonical key를 재구성해 exact match를 확인하고, local staging은 terminal 뒤 단일 pass,
+  S3 staging과 실패 canonical은 각각 grace 뒤 first delete와 confirmation grace 뒤 second delete가
+  모두 끝나야 완료한다. Historical NULL cleanup marker도 같은 reconciler가 처리하고 production에서
+  reconciler를 끄거나 실패 cleanup을 quota 해제로 간주하지 않는다. Sample 최종
+  등록은 PostgreSQL row lock뿐 아니라 SQLite에서도 유효한 Job no-op write fence 뒤 전체 claim을
+  다시 읽는다. Historical
+  `NULL` Job/attempt 해시는 현재 설정으로 추정 backfill하지 않고 새 claim/retry/model candidate에서
+  fail-closed하며 NULL queued row는 claim 후보 limit 전에 제외한다. Non-NULL corrupt queued Job은
+  정의된 `queued -> failed` 전이와 audit로 격리하고, corrupt attempt의 lease 회수는 자동 재큐잉하지
+  않는다. Attempt가 생긴 뒤 Job 해시를 바꾸거나 stale hash의 유효 JSON을 비교/MLflow/실행 증거로
+  사용하지 않는다.
 - **TLS 전달 신뢰 경계**: 외부 TLS proxy 뒤에서 browser HTTPS를 판정할 때 bundled proxy가
   `X-Forwarded-Proto`를 내부 HTTP 값으로 덮거나, 임의 client가 보낸 forwarding header를 신뢰하게
   해서는 안 된다. Dev.11의 operator-owned `PUBLIC_SCHEME` 단일 값, production https start gate,

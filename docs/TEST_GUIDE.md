@@ -71,14 +71,18 @@ dev.13, dev.15, dev.16, dev.17의 더 오래된 hash와 runbook도 폐기된 역
 
 | 단계 | 시험 대상 | dev.20 후보에서의 판정 |
 |---|---|---|
-| T0 | source lint/type/unit/frontend/build | 기준 PASS — Python 752/4 deselected, mypy 88, Web 24/211 |
-| T1 | localhost Manager↔Fake Worker HTTP protocol | 기준 PASS — `4 passed in 6.68s`; production/native 증거는 아님 |
+| T0 | source lint/type/unit/frontend/build | 현재 checkout PASS — Python 859/4 deselected, mypy 91, Web 26 files/223 tests; dev.20 archive source의 752/88/24·211은 역사 증적 |
+| T1 | localhost Manager↔Fake Worker HTTP protocol | 현재 source PASS — `4 passed in 7.18s`; dev.20의 6.68초 결과는 역사 증적이며 production/native 증거는 아님 |
 | T2 | migration/Compose, Docker 보안 smoke와 bundle 무결성 | Manager 8-image archive/loaded identity/amd64 Compose 기준 PASS; 사용자 재검증 필요 |
 | T2-MAINT | maintenance DB/Redis/S3 최소권한·heartbeat | exact release-image Compose 안에서 PASS; 사용자 환경 재검증 필요 |
 | T3 | self-contained Manager clean Ubuntu 설치·외부 TLS/browser smoke | `BLOCKED` — clean Ubuntu/외부 TLS 실증 대기 |
 | T4 | Worker preflight와 `--no-start` 구성/보호 gate | 사용자 실행 가능 — CONFIG-ONLY/native 거부가 기대 결과 |
 | T5 | 실제 native GPU 학습/Sample | `BLOCKED` — dev.20 Worker에 runtime image 없음 |
 | T6 | Manager backup/restore/rollback 장애 drill | 격리 Docker/복제 VM에서만 실행 |
+
+현재 859건 전체 실행에서는 TestSet late-PUT 취소 fixture의 aiosqlite `SAWarning`이 발생하지 않았다.
+과거 실행에서 간헐 관찰된 이 경고가 다시 나오면 삭제하지 말고 suite와 횟수를 기록한 뒤
+`-W error::sqlalchemy.exc.SAWarning` 단독 재현 결과도 함께 남긴다.
 
 `RVC_RUNTIME_INCLUDED=false`인 Worker가 native 설치를 거부하는 것은 실패가 아니라 보호 장치의
 합격이다. 반대로 Fake Worker가 production Manager에 등록되지 않는 것도 정상이다. 이 두 gate를
@@ -388,10 +392,40 @@ Worker 집중 회귀에서 검증한다. Visible GPU 값도 fixture이므로 실
 이 결과는 “Manager↔Fake Worker protocol E2E PASS”로 기록한다. “설치형 Manager↔실제 Worker”나
 “RVC 학습 E2E PASS”로 기록하면 안 된다.
 
-2026-07-13 dev.20 source에서 `make test-e2e`는 exit code 0과
-`4 passed in 6.68s`로 완료됐다. 이는 현재 source의 Fake protocol 기준선이며 사용자 환경의 시험을
-대체하지 않는다. 사용자도 localhost socket을 허용한 환경에서 같은 명령을 새로 실행해 exit code
-0과 `4 passed`를 직접 확인한 경우에만 자기 T1을 PASS로 기록한다.
+JobConfig snapshot 경계는 T0의 자동 회귀에서 별도로 확인한다.
+
+```bash
+.venv/bin/pytest -q \
+  packages/contracts/tests/test_contracts.py \
+  packages/contracts/tests/test_test_set_transfer_contracts.py \
+  apps/api/tests/test_api.py \
+  apps/api/tests/test_artifact_storage.py \
+  apps/api/tests/test_experiment_comparison.py \
+  apps/api/tests/test_migrations.py \
+  apps/api/tests/test_mlflow_integration.py \
+  apps/api/tests/test_model_registry.py \
+  apps/api/tests/test_sample_registration.py \
+  apps/worker/tests/test_artifact_upload.py \
+  apps/worker/tests/test_sample_config_validation.py \
+  apps/worker/tests/test_vertical_flow.py \
+  tests/infra/test_artifact_upload_contract.py
+```
+
+합격이면 신규 Job 생성 응답의 `config_sha256`, DB Job, exact attempt와 Worker claim 값이 같고,
+JSON/hash 변조는 배정·retry·model candidate, terminal/telemetry, Artifact/Sample 원장과 comparison/
+MLflow 증거를 만들지 않으며 Worker가 workspace 전에 재검증한다. Historical NULL 50개 뒤의 정상 Job도
+배정된다. Artifact는 local single-writer seal과 exact S3 conditional header를 사용하고, PUT 응답 유실·
+local `409`·S3 `412` 뒤 같은 session finalize로 수렴해야 한다. 실패 canonical은 즉시 사라지는 것이
+합격 조건이 아니다. Terminal CAS 뒤 stale grace가 지난 first delete와 confirmation grace 뒤 second
+delete가 모두 끝나야 cleanup marker와 quota가 해제된다. Reconciler가 stored key를 deterministic
+Job/attempt/type/session key와 다르게 읽으면 `cleanup_key_mismatch`로 닫고 object를 삭제하지 않아야 한다.
+이 테스트는 운영 DB를 직접 변조하라는 뜻이 아니다. 변조 회귀는 격리 SQLite fixture에서만 실행한다.
+
+2026-07-13 현재 `a7c4e9f2b610` source에서 `make test-e2e`는 exit code 0과
+`4 passed in 7.18s`로 완료됐다. dev.20 historical source의 별도 결과는 `4 passed in 6.68s`였다.
+둘 다 Fake protocol 증거이며 사용자 환경의 시험을 대체하지 않는다. 사용자도 localhost socket을
+허용한 환경에서 같은 명령을 새로 실행해 exit code 0과 `4 passed`를 직접 확인한 경우에만 자기 T1을
+PASS로 기록한다.
 
 ## 5. T2 — migration, Compose와 bundle 검증
 
@@ -412,10 +446,15 @@ DB_PATH=$(mktemp /tmp/rvc-alembic.XXXXXX)
 )
 ```
 
-합격 기준은 현재 source 단일 head와 dev.20 Manager archive marker가 모두
-`f5d1c8a9b240`이고
-`No new upgrade operations detected`인 것이다. 임시 DB 경로만
+합격 기준은 현재 source 단일 head가 `a7c4e9f2b610`이고
+`No new upgrade operations detected`인 것이다. Immutable dev.20 Manager archive의 marker는
+계속 `f5d1c8a9b240`이며 현재 checkout과 같아야 하는 값이 아니다. dev.20 archive를 시험할 때는 그
+archive 내부 revision set만 별도로 대조하고 현재 source/image와 섞지 않는다. 임시 DB 경로만
 정리하고 운영 DB에는 이 명령을 시험 삼아 실행하지 않는다.
+
+이 migration에는 Job hash뿐 아니라 Artifact upload writer/finalizer/cleanup token·heartbeat와
+staging/canonical first-delete·completion marker가 포함된다. Historical marker는 NULL로 보존되는 것이
+정상이며 새 API reconciler의 deterministic key 검증과 two-pass cleanup을 통해서만 수렴한다.
 
 ```bash
 case "$DB_PATH" in

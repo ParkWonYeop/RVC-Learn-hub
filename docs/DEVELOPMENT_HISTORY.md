@@ -4,6 +4,100 @@
 
 ## 2026-07-13
 
+### Canonical JobConfig 전 구간 결박과 Artifact upload writer/finalizer/cleanup 수렴
+
+**목적과 변경 범위**
+
+- 신규 Job의 기본값 포함 canonical JSON SHA-256을 Job, exact attempt와 Worker claim에 같은 값으로
+  저장하고 Worker가 workspace/RVC 실행 전에 다시 계산하도록 했다. Manager의 claim/retry/recovery,
+  active lease, terminal/telemetry, Artifact/Sample final fence, comparison/MLflow/model registry와 공개
+  Job config/engine projection도 exact current attempt hash를 재검증한다. Historical NULL은 추정
+  backfill하지 않고 queue starvation 없이 history-only로 보존하며 corrupt non-NULL row는 typed 실패로
+  격리한다.
+- Artifact local PUT에 UUID writer token, heartbeat, absolute expiry와 single seal CAS를 추가했다. S3
+  target은 `If-None-Match: *`를 서명·반환하고 Worker는 그 exact 값만 허용한다. PUT 성공 응답 유실,
+  sealed local `409`, conditional S3 `412`는 새 generation을 만들지 않고 같은 session finalize를 호출해
+  Manager가 object 전체 size/SHA-256을 최종 판정한다. Object가 실제 없을 때만 bounded retryable 오류다.
+- Target signing 전에 observational transaction을 끝내고, signer 반환 뒤 active lease/Job/current
+  attempt/config와 idempotency race를 다시 확인한 다음 quota와 session row를 reserve해 외부 signer 동안
+  attempt lock을 보유하지 않게 했다. Finalizer는 별도 UUID token/heartbeat와 terminal-first CAS를
+  유지한다.
+- 실패·만료 Artifact를 수렴시키는 API-owned background reconciler를 추가했다. RQ maintenance identity의
+  권한을 넓히지 않고 API storage identity로 별도 cleanup token/heartbeat를 claim한다. 삭제 전
+  Job/attempt/type/session ID로 staging/canonical key를 재구성하고 stored key와 exact 비교한다. Mismatch는
+  `cleanup_key_mismatch`로 fail-closed하며 object와 completion marker를 보존한다. Local staging은
+  terminal 뒤 single pass, S3 staging과 failed/expired canonical은 first delete와 confirmation grace 뒤
+  second delete가 모두 성공해야 완료·quota 해제된다. Historical NULL marker와 일시 storage failure도
+  bounded cycle에서 재처리한다. Production API는 reconciler 비활성 설정을 거부하고 `/ready`도
+  stopped/stale/storage 또는 key-integrity failure를 닫는다.
+- Migration `a7c4e9f2b610`에 Job/attempt hash·composite FK와 Artifact writer/finalizer/cleanup token,
+  heartbeat, staging/canonical first-delete/completion marker를 추가했다. Historical hash와 cleanup marker는
+  NULL로 보존한다. Manager/Worker wire 계약이 바뀌므로 같은 release 배포를 요구하며 immutable dev.20
+  archive는 새 source 설치 파일로 재표시하지 않았다.
+
+**변경 파일과 검증**
+
+- 핵심 변경: `packages/contracts/src/rvc_orchestrator_contracts/{job,status,worker}.py`,
+  `apps/api/src/rvc_manager_api/{models,schemas,storage,config,app}.py`,
+  `apps/api/src/rvc_manager_api/services/{job_configs,artifact_cleanup,workers,samples,model_registry,mlflow,experiment_comparison}.py`,
+  `apps/api/src/rvc_manager_api/routers/{workers,artifacts,experiments,health}.py`,
+  `apps/worker/src/rvc_worker/{agent,client}.py`, `infra/compose/manager.compose.yml`, `.env.example`와
+  `apps/api/alembic/versions/a7c4e9f2b610_job_config_integrity.py`.
+- 계약/API/Worker/infra 회귀를 갱신하고 `tests/infra/test_artifact_upload_contract.py`를 추가했다. Exact
+  Manager header의 Worker PUT 전달과 Authorization 비전달, local writer 경쟁/seal, ACK 유실/409/412
+  finalize, S3 late PUT confirmation delete, cleanup outage 재시도·quota 해제, historical NULL marker,
+  reconstructed key mismatch 무삭제, production readiness를 고정했다.
+- Fresh SQLite DB에서 최초 revision부터 `a7c4e9f2b610`까지 `alembic upgrade head`가 통과했다. 최종
+  `make check`는 Ruff, strict mypy `91 source files`, Python `859 passed, 4 deselected`, Web
+  `26 files/223 tests`, ESLint, Next.js production build 19 pages, shell syntax와 `git diff --check`를 모두
+  통과했다. Localhost Manager↔Fake Worker HTTP E2E는 최종 `4 passed in 7.18s`였다.
+- 두 차례 독립 read-only 감사에서 처음 발견된 conditional header 불일치, ACK 유실, cleanup consumer
+  부재, 단일 S3 delete, signer lock, production-disable readiness와 stored-key arbitrary delete 경계를
+  회귀와 함께 수정했다. 최종 재감사는 P1/P2 잔여 없음과 관련 121개 회귀 통과를 확인했다.
+
+**문서·운영 영향과 남은 위험**
+
+- `AGENTS.md`, `CHECKLIST.md`, `README.md`, Architecture/Security/Deployment/Installation/Operations/
+  Testing/Test Guide/Requirements Traceability를 writer/finalizer/cleanup의 서로 다른 token 경계,
+  a7 drain·readiness와 실제 테스트 가능 범위에 맞췄다.
+- 현재 source의 Manager/API/Web/DB와 Fake Worker 기능 시험은 가능하지만, a7을 포함한 새 self-contained
+  Manager archive는 아직 만들지 않았다. 기존 dev.20 archive는 `f5d1c8a9b240` 역사 산출물이다.
+  실제 외부 MinIO/S3 장기 PUT·late publisher/outage, PostgreSQL 다중 replica cleanup 경쟁과 clean Ubuntu
+  설치 인수는 남아 있다. Worker의 reviewed amd64 base digest, wheelhouse/asset byte와 49-case GPU/
+  no-network qualification도 없으므로 native NVIDIA RVC 학습·Sample과 production 설치 인수는 계속
+  `BLOCKED`다.
+
+### 공개 Job 목록·상세의 current-attempt config/engine fail-closed 투영
+
+**목적과 변경 범위**
+
+- 공개 Job 변환은 Job 자체의 canonical config는 확인했지만 current attempt에서는 ID, Job ID와
+  engine mode 세 컬럼만 읽었다. Attempt가 사라졌거나 `job_config_sha256`이 NULL/불일치해도 engine만
+  `null`로 낮춘 채 config를 200으로 반환할 수 있어 immutable snapshot과 실행 증거가 분리될 수 있었다.
+- `experiments.py::_jobs_to_schema`가 모든 `current_attempt_id`의 전체 `JobAttempt`를 한 번에 다시 읽고,
+  `job_to_schema`가 exact attempt ID/Job ID와 `validated_job_config(job, attempt=...)`를 통과한 경우에만
+  config와 `WorkerEngineMode`를 함께 투영하도록 변경했다. Attempt 누락·교차 결박·NULL/불일치 hash와
+  invalid engine은 목록 전체 또는 상세를 동일한 `409`로 닫는다. Current attempt가 없는 historical
+  NULL-hash Job만 실행 engine evidence 없이 기존 조회 정책을 유지한다.
+
+**변경 파일과 검증**
+
+- 변경: `apps/api/src/rvc_manager_api/routers/experiments.py`, `apps/api/tests/test_api.py`,
+  `CHECKLIST.md`, `docs/ARCHITECTURE.md`, `docs/REQUIREMENTS_TRACEABILITY.md`,
+  `docs/DEVELOPMENT_HISTORY.md`.
+- 신규 parameterized 회귀는 active attempt hash NULL/불일치, raw config/hash 불일치, 존재하지 않는
+  `current_attempt_id`와 invalid engine 각각에서 Job 상세와 Experiment-filtered 목록이 모두 `409`이며
+  config/engine field나 Fake engine 문자열을 반환하지 않는지 확인한다. Hash 불일치는 SQLite의
+  composite FK를 시험 안에서만 일시 중지해 pre-constraint/corrupt ledger를 재현한 뒤 즉시 복구했다.
+- 신규 집중 회귀는 `5 passed`, `apps/api/tests/test_api.py` 전체는 `38 passed`, Experiment comparison은
+  `4 passed`였다. 변경 router의 strict mypy, Ruff와 변경 파일 `git diff --check`도 통과했다.
+
+**남은 위험**
+
+- 이번 검증은 SQLite API 회귀다. PostgreSQL composite FK는 신규 mismatch를 차단하지만, 실제
+  PostgreSQL에서 손상된 historical attempt를 주입한 read-negative 통합 검증은 별도로 남아 있다.
+  한 페이지에 손상 Job 하나가 있으면 partial list 대신 전체 `409`로 닫히는 것은 의도한 정책이다.
+
 ### Model Registry 응답 유실 same-intent reconciliation과 실제 Manager 브라우저 스모크
 
 **목적과 변경 범위**

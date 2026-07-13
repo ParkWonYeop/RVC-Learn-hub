@@ -84,6 +84,16 @@
   - [x] immutable name/Dataset, Job·MLflow 참조 delete 차단과 legacy duplicate quarantine
   - [x] 16 KiB raw JSON, pagination, 동시 update/name conflict와 migration 회귀
 - [x] Job config 스키마와 version-aware 검증
+  - [x] 기본값 포함 canonical SHA-256을 Job→attempt→claim에 결박하고 Worker 실행 직전 재검증,
+    JSON/hash 변조와 historical NULL claim/retry/registry fail-closed (`a7c4e9f2b610`)
+  - [x] active lease·terminal/telemetry·Artifact/Sample 최종 fence, 비교/MLflow projection 재검증,
+    NULL queue starvation 차단과 corrupt Job/attempt 격리
+  - [x] 공개 Job 목록·상세의 exact current-attempt hash/engine 재검증과 config/evidence fail-closed
+  - [x] Artifact local single-writer token/heartbeat/seal과 S3 `If-None-Match: *`, PUT 응답 유실·
+    local `409`·S3 `412` 뒤 같은 session finalize 및 Manager→Worker 교차 계약
+  - [x] Artifact finalizer UUID token/독립 heartbeat와 terminal-first CAS, API-owned cleanup claim,
+    재구성 key 검증, S3 staging/canonical confirmation delete와 historical NULL marker 수렴
+  - [x] Sample SQLite write fence로 stale finalizer·긴 검증 뒤 원장 경쟁 차단
 - [x] Job 생성/조회/filter/pagination API
 - [x] 우선순위와 Worker tag/VRAM capability matching
 - [x] 원자적 next-job 배정 및 lease 갱신

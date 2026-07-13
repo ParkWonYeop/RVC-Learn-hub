@@ -120,6 +120,51 @@ JSON 상한을 검증한다. migration은 historical duplicate name과 owner 없
 삭제하지 않고 conflict key `NULL`로 보존하며, 이미 유일한 owner/name만 unique key로 backfill한다.
 SQLite upgrade/downgrade와 PostgreSQL offline SQL, Job→Experiment `RESTRICT`도 확인한다.
 
+## JobConfig immutable snapshot
+
+```bash
+.venv/bin/pytest -q \
+  packages/contracts/tests/test_contracts.py \
+  packages/contracts/tests/test_test_set_transfer_contracts.py \
+  apps/api/tests/test_api.py \
+  apps/api/tests/test_artifact_storage.py \
+  apps/api/tests/test_experiment_comparison.py \
+  apps/api/tests/test_migrations.py \
+  apps/api/tests/test_mlflow_integration.py \
+  apps/api/tests/test_model_registry.py \
+  apps/api/tests/test_sample_registration.py \
+  apps/worker/tests/test_artifact_upload.py \
+  apps/worker/tests/test_sample_config_validation.py \
+  apps/worker/tests/test_vertical_flow.py \
+  tests/infra/test_artifact_upload_contract.py
+```
+
+Contract는 key 순서와 무관한 고정 golden SHA-256, 기본값 포함, non-finite 거부, JSONB signed-zero
+정규화와 wire config/hash
+불일치를 검사한다. Manager는 생성 응답·DB Job·새 JobAttempt·claim의 hash가 같은지, raw JSON·저장
+hash·NULL 변조가 attempt/lease를 만들지 않는지, historical NULL 50개가 정상 claim을 굶기지 않는지,
+retry/recovery가 무결성 없는 attempt를 재큐잉하지 않는지 확인한다. Active heartbeat/renew/status/
+telemetry와 Artifact canonical 게시 후 final fence, Sample 및 comparison/MLflow projection도 stale
+config를 거부한다. Artifact 회귀는 local writer token/heartbeat/seal, exact S3
+`If-None-Match: *`, finalizer token 교체, API cleanup claim과 deterministic key reconstruction을
+검사한다. Transport 오류와 sealed local `409`/conditional S3 `412` 뒤 같은 session finalize로
+수렴하고, object가 없으면 bounded retryable failure가 되는지도 확인한다. Mock S3 first/confirmation
+delete는 late PUT을 제거한 뒤에만 cleanup을 완료하며 failure 재시도 뒤 quota가 해제된다. Cross-side
+회귀는 Manager가 생성한 실제 header를 Worker validator/PUT에 전달하고 Authorization을 object endpoint로
+보내지 않는지 확인한다. Sample 회귀는 SQLite write fence와 같은 stored hash를 유지한 raw JSON 변조까지
+확인한다. Worker HTTP client는 누락/불일치 hash 응답을 typed protocol 오류로
+거부하고 Agent는 wire parse 뒤 config가 변해도 workspace와 runner 전에 닫힌다. Registry는 attempt
+hash가 NULL이면 candidate를 만들지 않으며, Job/attempt의 서로 다른 non-NULL hash는 DB composite
+foreign key가 저장 단계에서 거부한다.
+
+Migration `a7c4e9f2b610` 회귀는 historical Job/attempt hash를 NULL로 보존하고 길이/lowercase 제약,
+SQLite composite FK와 일치 hash 저장, unique Job binding, Artifact writer/finalizer/cleanup token과
+staging/canonical first-delete/completion marker의 nullable upgrade/downgrade, child row 보존 및
+PostgreSQL offline SQL을 검증한다. Historical terminal Artifact의 NULL marker는 API reconciler가
+deterministic key/namespace를 다시 확인한 뒤 처리하며 migration에서 완료로 backfill하지 않는다. 이 fixture는
+실제 PostgreSQL upgrade lock/traffic 경쟁을 대신하지 않으므로 운영 upgrade 전 queued/retrying Job을
+drain하고 backup한다.
+
 ## Model registry와 explicit champion
 
 ```bash
@@ -552,7 +597,9 @@ Stage error taxonomy와 no-replay policy는 별도 fixture로 검증한다.
 전체 stage의 timeout mapping, training/checkpoint/index nonzero 단일 호출, unknown fallback,
 cancel/lease 우선순위, claim configuration과 runtime-unready 분리, Dataset/TestSet/Artifact
 transient bounded exhaustion, Dataset/TestSet integrity 무재시도, telemetry deferred replay와 spool failure를
-검증한다. terminal payload와 Agent log에 fixture token, argv, local path 및 URL/query sentinel이
+검증한다. Artifact target은 exact conditional-create header만 허용하고 PUT ACK 유실/409/412 뒤 finalize로
+수렴하며, Manager→Worker 교차 계약은 `tests/infra/test_artifact_upload_contract.py`에서 별도 고정한다.
+terminal payload와 Agent log에 fixture token, argv, local path 및 URL/query sentinel이
 없고 error code/message가 typed taxonomy에서 결정되는지도 확인한다.
 
 ## 설치 bundle과 installed release closure

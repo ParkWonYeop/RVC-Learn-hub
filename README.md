@@ -107,6 +107,20 @@ Manager는 정확히 8개의 linux/amd64 image를 포함한 `SELF_CONTAINED=true
 partial archive다. 따라서 중앙 서버의 image 포함 기능 시험은 가능하지만 실제 GPU 학습 서버와
 최종 production 설치 파일 인수는 아직 불가능하다.
 
+현재 checkout의 Alembic head는 JobConfig canonical hash ledger를 추가한 `a7c4e9f2b610`이다.
+신규 Job은 정규화 설정 SHA-256을 Job, attempt와 Worker claim에 동일하게 기록하고 Worker가 실행 직전
+재검증한다. Manager도 active lease, terminal/telemetry, Artifact/Sample 최종 commit과 comparison/
+MLflow projection에서 같은 attempt hash를 재검증한다. 이 migration은 Artifact upload writer/finalizer/
+cleanup token·heartbeat와 staging/canonical first-delete·completion marker도 추가한다. Local PUT은
+single-writer seal, S3는 exact conditional create를 사용하며 응답 유실 뒤에도 같은 session finalize로
+Manager의 전체 byte 검증을 받는다. 실패한 canonical과 S3 staging은 API-owned reconciler가 재구성한
+exact key만 first/confirmation 두 단계로 삭제하므로 실패 직후 object 부재를 합격 조건으로 삼지 않는다.
+기존 dev.20 archive는 이 migration과 코드를 포함하지 않는 immutable 역사 산출물이므로
+현재 source 설치 파일로 표현하지 않는다. 새 Manager 설치 후보를 만들 때는 새 version과
+`--schema-compatibility a7c4e9f2b610`을 사용해 다시 build·검증해야 하며, 그 archive는 아직 생성되지
+않았다. `config_sha256`은 Job claim의 필수 wire field이므로 이 source의 Manager와 Worker는 반드시
+같은 release로 배포해야 하며, 차기 Manager를 dev.20 Worker와 혼용해서는 안 된다.
+
 - `dist/installers/rvc-manager-0.1.0-dev.20-linux-amd64.tar.gz`
   (`667617422` byte,
   `c6488dad47c7f38c082ed6fa68f1fe3691c069110aef0bbf68a9d7ba5e6f5b70`)
@@ -155,5 +169,10 @@ MinIO, secret projection 및 전체 Manager Compose smoke가 PASS했고 Alembic 
 release image 전체 Compose smoke까지 PASS했다. 이 dev.20 runtime smoke는 arm64 Colima의 amd64
 emulation 증거이며 clean Ubuntu x86_64 native 인수는 아니다. dev.20 archive의 40-hex source commit,
 clean-tree/source closure와 tracked revision의 `git diff --check`는 검증됐다.
+
+같은 날짜의 현재 `a7c4e9f2b610` checkout은 `make check`에서 Ruff, strict mypy `91 source files`,
+Python `859 passed, 4 deselected`, Web `26 files/223 tests`, ESLint, Next.js 19 page build, shell syntax와
+`git diff --check`를 통과했다. 별도 localhost Manager↔Fake Worker HTTP E2E는 `4 passed in 7.18s`다.
+이는 최신 source 중앙 기능 증거이며 새 self-contained archive나 실제 NVIDIA/RVC 학습 증거는 아니다.
 정확한 SHA-256, 선행 image 준비와 현재 가능한 시험 범위는
 [설치 가이드](docs/INSTALLATION_GUIDE.md)에서 먼저 확인한다.
