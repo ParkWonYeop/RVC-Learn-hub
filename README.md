@@ -1,178 +1,389 @@
-# RVC Training Orchestrator
+<h1 align="center">RVC Training Orchestrator</h1>
 
-여러 GPU 학습 서버에서 RVC v1/v2 학습을 수행하고 중앙에서 데이터셋, 작업, 로그, 지표, 모델, 인덱스와 샘플 음성을 관리하는 플랫폼이다.
+<p align="center"><strong>여러 GPU 학습 서버의 RVC 학습을 한곳에서 계획하고, 실행하고, 검증하는 오케스트레이션 플랫폼</strong></p>
 
-## 구성
+<p align="center">Dataset · Experiment · Job · Worker · Telemetry · Artifact · Sample · Model Registry</p>
 
-- **Manager**: FastAPI API, Next.js 대시보드, PostgreSQL, Redis, MinIO/S3, MLflow, reverse proxy
-- **Worker**: GPU 상태 수집, 작업 수신, RVC 명령 실행, 로그/지표 파싱, 결과물 업로드
-- **Deployment**: 중앙 서버와 학습 서버용 Docker 구성 및 Linux 설치 패키지
+<p align="center"><code>RVC v1/v2</code> &nbsp; <code>FastAPI</code> &nbsp; <code>Next.js</code> &nbsp; <code>PostgreSQL</code> &nbsp; <code>Redis/RQ</code> &nbsp; <code>MinIO/S3</code> &nbsp; <code>MLflow</code></p>
 
-현재 구현 진행 상황은 [CHECKLIST.md](CHECKLIST.md), 변경 이유와 검증 내역은 [docs/DEVELOPMENT_HISTORY.md](docs/DEVELOPMENT_HISTORY.md)에서 확인한다. 모든 작업자는 먼저 [AGENTS.md](AGENTS.md)를 읽어야 한다.
+<p align="center"><a href="#아키텍처">아키텍처</a> · <a href="#rvc-지원-범위">지원 범위</a> · <a href="#개발-시작">개발 시작</a> · <a href="#현재-출시-상태">출시 상태</a> · <a href="#문서-지도">문서 지도</a></p>
 
-실행형 설치 절차는 [docs/INSTALLATION_GUIDE.md](docs/INSTALLATION_GUIDE.md), 단계별 합격 기준과
-증적 수집은 [docs/TEST_GUIDE.md](docs/TEST_GUIDE.md)를 따른다.
-[docs/TEST_RESULT_TEMPLATE.md](docs/TEST_RESULT_TEMPLATE.md)는 사용자가 실행 결과를 기록해
-전달할 때 복사해 쓰는 양식이다. 패키징·배포 상세는
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), 역할별 운영 runbook은
-[docs/OPERATIONS_GUIDE.md](docs/OPERATIONS_GUIDE.md), 자동 테스트 범위는
-[docs/TESTING.md](docs/TESTING.md)에 유지한다. RVC/CUDA 호환 출시는
-[docs/RVC_RUNTIME_MATRIX.md](docs/RVC_RUNTIME_MATRIX.md), 보안 기본값은
-[docs/SECURITY.md](docs/SECURITY.md), SBOM과 라이선스 report의 증명 범위는
-[docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md)를 따른다. 실제 GPU 결과를 capability로 연결하는
-증적 schema와 절차는 [docs/RUNTIME_QUALIFICATION.md](docs/RUNTIME_QUALIFICATION.md)에 있다.
+> [!IMPORTANT]
+> 이 저장소는 아직 `v1.0` production release가 아니다. 중앙 기능과 Fake Worker 기반 E2E는
+> 폭넓게 검증됐지만, 실제 NVIDIA GPU/RVC runtime, 49-case qualification, clean Ubuntu 설치,
+> 브라우저 접근성, 외부 TLS 및 supply-chain 최종 인수는 남아 있다. Fake 결과를 실제 RVC 학습
+> 증거로 해석하지 않는다.
 
-## 핵심 원칙
+## 무엇을 해결하나
 
-- 중앙 Manager는 RVC 학습을 직접 실행하지 않는다.
-- Worker는 RVC WebUI 저장소를 외부 학습 엔진으로 감싸며 v1/v2 산출물 차이를 명시적으로 처리한다.
-- 학습용 F0 방식과 샘플 생성용 F0 방식을 분리한다.
-- `G_*.pth`/`D_*.pth` 체크포인트와 배포용 small model을 구분한다.
-- 업로드된 데이터셋은 검증하고 평탄화한 뒤 안전한 파일명으로 RVC에 전달한다.
+RVC 학습을 여러 서버에서 운영하면 데이터셋 준비, GPU 배정, 장시간 작업의 상태 추적, 산출물 수집,
+실험 비교와 재현성 확보가 서로 다른 스크립트와 디렉터리에 흩어지기 쉽다. RVC Training
+Orchestrator는 이 흐름을 중앙 Manager와 원격 Worker로 나눠 하나의 검증 가능한 작업 원장으로
+관리한다.
 
-## 개발 상태
+| 관심사 | 제공하는 경계 |
+|---|---|
+| 중앙 관리 | Dataset, Experiment, Job, Worker, 사용자와 모델 승인 상태를 한곳에서 관리한다. |
+| 분산 실행 | GPU Worker가 lease로 작업을 하나씩 claim하고 RVC 엔진을 로컬에서 실행한다. |
+| 실시간 관측 | 학습 로그, loss/epoch, GPU 사용률, VRAM, 온도와 disk 상태를 attempt 순서에 맞춰 수집한다. |
+| 산출물 검증 | 모델, 체크포인트, 인덱스와 샘플의 크기·SHA-256·provenance를 검증한 뒤 canonical object로 게시한다. |
+| 실험 비교 | 같은 Experiment의 설정, 지표, 산출물과 동일 TestSet item의 Sample을 나란히 비교한다. |
+| 운영 안전 | 인증 분리, 원자적 lease, immutable JobConfig, 경로 검증, non-root container와 최소 권한을 기본값으로 둔다. |
 
-Manager의 인증/원장, 검증형 Dataset·Artifact data plane, lease 기반 Worker protocol,
-실시간 관측 대시보드, MLflow durable projection, canonical Dataset Worker 전송과 pinned RVC
-typed adapter의 guarded `native` 실행 경계, immutable TestSet/Preset/Sample 원장, 검증형
-고정 WAV data plane, lease-bound TestSet 수신과 canonical Sample 등록/completion gate까지
-구현되어 있다. Native에는 pinned RVC Pipeline 기반 PM/Harvest/RMVPE와 고정
-`runtime/crepe/full.pth`를 `weights_only=True`로 strict prebind하는 CREPE 고정 TestSet 추론,
-결정적 manifest/publication 경계가 연결돼 있다. CREPE byte는 asset/projection manifest의
-size·SHA-256과 attempt-private exact inventory에 결박되고 request에는 host path를 싣지 않는다.
-Manager는 approved runtime digest 쌍,
-model/index/output 역할과 manifest/request SHA-256, 현재 canonical byte/PCM 지표를 완료 직전에
-다시 검증한다. TestSet PUT/finalize는 generation-token heartbeat와 절대 deadline을 사용하고,
-전용 RQ maintenance가 유효 grace 뒤 staging을 두 번 확인 삭제한다. Worker token은 응답 유실을
-복구하는 idle-only 2단계 회전, 관리자 긴급 폐기와 inactive-only 동일 identity 재등록을 제공한다.
-Experiment는 immutable name/Dataset 위에서 description row-version CAS와 참조 안전 삭제를
-제공하며, 대시보드는 해당 수정/삭제 BFF와 검증된 Sample 재생·동일 TestSet item 기준 A/B 비교를
-제공한다. Model registry는 exact current real `rvc_webui` attempt의 reviewed commit·승인 runtime
-provenance와 Manager가 재해시한 canonical model/index만 candidate로 받고,
-`candidate -> approved -> revoked` 상태, Experiment별 active champion 0/1과 이전 approved 모델의
-rollback promotion을 PostgreSQL 원장에 보존한다. Owner/admin CAS·hashed idempotency·audit API와
-same-origin BFF/UI는 Fake 결과의 후보 등록을 차단하고 checksum/runtime provenance를 표시한다.
-Dataset raw PUT/finalize도 generation heartbeat, upload-session별 canonical namespace와
-확인형 이중 staging cleanup으로 늦은 writer/finalizer를 replacement 세대와 격리한다.
-Dataset 품질 응답은 내부 raw report를 노출하지 않고 `pcm-sample-weighted-v1`의 exact interleaved
-sample count 가중 clipping/silence와 raw square-sum RMS, typed issue count만 반환한다. exact 표본 수가
-없는 기존 행은 값을 만들지 않고 `null`로 유지한다. Integrated loudness도
-`itu-r-bs1770-4-mono-stereo-v1`과 Dataset-global 2단계 gate로 계산하며, 계산할 수 없는 입력과
-migration 전 행은 숫자를 추정하지 않고 typed reason 또는 historical `null`로 구분한다.
-관리자는 `/users` 화면에서 계정을 생성하고 역할·활성 상태를 row-version CAS로 변경하거나
-비밀번호를 재설정할 수 있다. 마지막 활성 관리자와 자기 계정 강등/비활성화는 차단되고,
-권한·활성·비밀번호 변경은 이전 access token을 영구 무효화한다. 실제 HTTP E2E는 세 Worker
-Agent가 같은 Dataset의 서로 다른 F0 조건 Job을 동시에 claim·완료하는 경로와 heartbeat/terminal
-Worker 행 충돌의 bounded fence 재검증을 포함한다.
-Active Job은 시작 직후와 기본 60초 간격의 GPU별 사용률·VRAM·온도 및 남은 disk를 loss/epoch와
-같은 durable attempt metric sequence에 저장한다. GPU query 실패와 실제 0-GPU를 availability로
-구분하고, Job 상세는 최신 200개를 15초 간격으로 갱신해 terminal watermark까지 연결한다.
-Manager/Worker bundle builder, Manager backup/restore/rollback과 partial SBOM도 제공한다. Installer image
-closure v2는 self-contained Manager의 정확한 8개 image와 Worker runtime 1개를 archive byte,
-image/config digest, linux/amd64, release label에 결박하고 load 전·후와 start/rollback 시 다시
-검증한다. 설치 파일은 strict closed-world checksum inventory로 추가·누락 파일도 거부하며,
-설치된 release에는 mode `0444` `RELEASE_SHA256SUMS`를 생성해 start/restart/rollback 전에 다시
-검증한다. 개발 번들은 이 계약을 사용하되 image가 없는 `self_contained=false`로 명시된다.
-Worker Sample activation은 49개 GPU/no-network report archive와 exact runtime image/build/asset
-identity를 검증한 builder만 mode `0444` projection으로 생성할 수 있다. Compose는 projection을
-고정 read-only 경로에 mount하며 production factory와 Agent capability는 실제 binding evidence가
-있을 때만 네 inference F0 방식을 연다. 사용자 env/YAML/CLI flag로 이 경계를 열 수 없다.
-Release engineering용 Worker factory는 2단계다. 먼저 exact runtime image와 세 activation gate가
-false인 `NATIVE-CANDIDATE-UNVERIFIED` core 후보를 만든다. 그 exact image ID로 49-case를 끝낸 뒤에만
-별도 qualified factory가 기존 image를 다시 build·retag·remove하지 않고 증적을 결박해 재포장한다.
-두 단계는 같은 basename을 서로 다른 output directory에 보존한다. 각 factory는 private stable
-snapshot의 외부 checksum, safe tar, 내부 exact ledger/image closure와 runtime ID를 다시 검증하고 final
-archive pair를 덮어쓰기 없이 게시한다. Qualified 후보도 scan·license·reviewer·clean-host gate를 별도로
-통과하기 전에는 production 설치 파일이 아니다. 현재 실제 runtime 입력이 없어 이 factory로 생성한
-Worker archive 증적은 아직 없다.
+### 이런 흐름에 맞는다
 
-아직 v1.0은 아니다. Dataset finalize RQ/tombstone maintenance 확대, non-WAV
-sandbox decoder, 실제 CREPE weight의 출처·라이선스·SHA 승인, Torch 2.6.0/cu124 후보 runtime의
-reviewed base digest·전체 GPU/no-network matrix와 실제 browser Experiment mutation/Sample 비교 E2E,
-관리자 사용자 lifecycle의 session 폐기·반응형·keyboard/screen-reader browser E2E,
-model registry의 실제 browser/API response-loss·동시 promotion E2E, 실제 PostgreSQL 다중 replica
-promotion 경쟁과 MinIO/S3 대용량 canonical 재해시·tamper/outage 인수, 장기 S3 PUT 및 MinIO 장애 주입,
-clean Ubuntu/NVIDIA GPU smoke, 완전한 SBOM/취약점·라이선스 검토가 출시 gate로 남아 있다.
-따라서 현재 증적 없는 개발 bundle의 Agent는 `fixed_test_set_inference_ready=false`를 광고하고
-운영 auto-sample gate는 닫힌 상태다.
-`CHECKLIST.md`에서 검증된 항목만 완료로 취급하며, 개발용 Fake 결과나 GPU를 쓰지 않은
-fixture 결과를 실제 RVC 학습 인증으로 해석하지 않는다.
+- 한 대의 중앙 서버에서 여러 GPU 학습 서버의 상태와 작업을 관리하고 싶을 때
+- RVC v1/v2, F0 방식과 학습 설정 조합을 같은 Dataset 기준으로 비교하고 싶을 때
+- `G_*.pth`/`D_*.pth` 체크포인트와 배포용 small model을 혼동하지 않고 수집하고 싶을 때
+- 모델·인덱스·샘플을 실행 attempt, runtime image와 asset checksum까지 추적하고 싶을 때
+- 개발용 Fake 실행과 실제 `rvc_webui` 실행을 UI와 원장에서 명확히 구분하고 싶을 때
 
-## 현재 검증된 개발 설치 번들
+## 아키텍처
 
-dev.20 Manager와 Worker archive는 tracked source commit
-`298ee1ec112cc7dc3a55d8374bba8c9e38f9f55a`와 Manager schema head `f5d1c8a9b240`에 결박돼 있다.
-Manager는 정확히 8개의 linux/amd64 image를 포함한 `SELF_CONTAINED=true` 개발 후보이고, Worker는
-`SELF_CONTAINED=false`, empty image inventory, runtime/GPU/profile/Sample gate가 모두 false인 별도
-partial archive다. 따라서 중앙 서버의 image 포함 기능 시험은 가능하지만 실제 GPU 학습 서버와
-최종 production 설치 파일 인수는 아직 불가능하다.
+Manager는 제어 평면과 중앙 원장을 담당하고, Worker만 RVC 학습 프로세스를 실행한다. Redis나 내부
+데이터베이스를 Worker에 노출하지 않으며, Worker는 Manager의 HTTP protocol로만 작업을 claim하고
+lease를 갱신한다.
 
-현재 checkout의 Alembic head는 JobConfig canonical hash ledger를 추가한 `a7c4e9f2b610`이다.
-신규 Job은 정규화 설정 SHA-256을 Job, attempt와 Worker claim에 동일하게 기록하고 Worker가 실행 직전
-재검증한다. Manager도 active lease, terminal/telemetry, Artifact/Sample 최종 commit과 comparison/
-MLflow projection에서 같은 attempt hash를 재검증한다. 이 migration은 Artifact upload writer/finalizer/
-cleanup token·heartbeat와 staging/canonical first-delete·completion marker도 추가한다. Local PUT은
-single-writer seal, S3는 exact conditional create를 사용하며 응답 유실 뒤에도 같은 session finalize로
-Manager의 전체 byte 검증을 받는다. 실패한 canonical과 S3 staging은 API-owned reconciler가 재구성한
-exact key만 first/confirmation 두 단계로 삭제하므로 실패 직후 object 부재를 합격 조건으로 삼지 않는다.
-기존 dev.20 archive는 이 migration과 코드를 포함하지 않는 immutable 역사 산출물이므로
-현재 source 설치 파일로 표현하지 않는다. 새 Manager 설치 후보를 만들 때는 새 version과
-`--schema-compatibility a7c4e9f2b610`을 사용해 다시 build·검증해야 하며, 그 archive는 아직 생성되지
-않았다. `config_sha256`은 Job claim의 필수 wire field이므로 이 source의 Manager와 Worker는 반드시
-같은 release로 배포해야 하며, 차기 Manager를 dev.20 Worker와 혼용해서는 안 된다.
+```mermaid
+flowchart LR
+    User["Browser / Operator"] -->|"HTTPS"| Proxy["Reverse Proxy"]
+    Proxy --> Web["Next.js Dashboard"]
+    Proxy --> API["FastAPI Manager"]
 
-- `dist/installers/rvc-manager-0.1.0-dev.20-linux-amd64.tar.gz`
-  (`667617422` byte,
-  `c6488dad47c7f38c082ed6fa68f1fe3691c069110aef0bbf68a9d7ba5e6f5b70`)
-- `dist/installers/rvc-worker-0.1.0-dev.20-linux-amd64.tar.gz`
-  (`108488` byte,
-  `7f36cbf27100bf70425c2780142d4fa3f6e6e76d0acf410d3e3fb698aa50558b`)
+    subgraph Manager["Manager node"]
+        Web
+        API
+        DB[("PostgreSQL\nsource of truth")]
+        Queue["Redis / RQ\nmaintenance"]
+        Storage[("MinIO / S3\ncanonical objects")]
+        Tracking["MLflow\nderived projection"]
+        API --> DB
+        API --> Queue
+        API --> Storage
+        API --> Tracking
+    end
 
-각 archive 옆의 `.sha256`, archive 내부 `SHA256SUMS`의 exact inventory와 image manifest v2가
-검증됐다. 압축을 푼 bundle에는 현재 version에 맞춘 `README.md`, `TESTING.md`와
-`TEST_RESULT_TEMPLATE.md`가 있으며
-`python3 common/image_bundle.py verify-ledger --root . --ledger-name SHA256SUMS`로 누락뿐 아니라
-추가 파일도 확인한다. dev.12는
-dev.11의 trusted HTTPS와 system metric 경계에 더해 root 소스 secret을 API·maintenance·MLflow별
-비루트 runtime volume으로 원자 투영하는 초기화 단계, Manager/MLflow의 exact MinIO bucket policy,
-JobAttempt 기반의 authoritative engine mode와 Fake 결과 경고 UI를 포함한다.
-dev.13은 이 dev.12 경계를 보존하면서 Dataset integrated LUFS, strict 설치 release file/environment
-closure와 bundle-local 설치·시험 문서를 추가했고, dev.14는 proxy foreground 실행,
-MinIO/MLflow loopback publish network와 실제 Manager 전체 Compose smoke를 보강했다. dev.15는
-release source ignore closure, Docker config byte/digest와 application `Config.User` 결박,
-누락된 bundle checksum ledger 거부, forward-only upgrade와 전환 전 Compose 검증, uninstall 실패
-전파를 추가했다. dev.16은 이 경계를 유지하면서 physical installed-release 검증 runbook,
-bundle-local 결과 템플릿, exact MLflow overlay lock, Manager self-contained release orchestrator와
-Worker read-only release-readiness report를 추가했다. dev.17은 Experiment 비교 BFF/UI source,
-Worker custom CA installer와 fixed read-only mount/공통 strict SSL context, bundle-local native
-negative runbook과 설치 가이드의 fail-fast·고정 hash·config-only·secret pre-state 보정을 추가했다.
-dev.18은 이 경계를 보존하면서 model registry 원장/API/BFF/UI와 `e4c7b9d2f610` migration을
-추가했다. dev.19는 전용 maintenance PostgreSQL/Redis/S3 identity, 장기 cleanup heartbeat와
-`f5d1c8a9b240` parent-lock 함수 migration을 추가했다. dev.20은 clean committed source에서
-Manager application 3개와 dependency alias 5개를 정확한 linux/amd64 Docker-save closure로 만들고,
-OCI image identity와 config byte digest를 따로 검증하는 self-contained Manager 후보를 추가했다.
-dev.15의 내장 runbook은 `current` symlink를 verifier root로 넘기는 명령 오류가 있고 dev.16은
-custom CA와 이번 runbook audit 보정이 없으므로 새 설치·시험에는 dev.20을 사용한다. dev.14 이하는
-code guard 자체도 없다. dev.20 Manager는 설치·업그레이드·백업·복구 스크립트, Compose/프록시,
-partial SBOM/license report와 8개 image를 포함한다. Worker는 동일 version과 source provenance를
-갖지만 runtime image를 포함하지 않으므로 별도 image를 준비해도 `SOURCE-MIXED` 구성 시험일 뿐이다.
-두 설치 파일을 air-gapped production release 또는 `v1.0.0`으로 표현하거나 Worker gate 값을
-수정하면 안 된다. Trusted scheme 구현도 clean browser/TLS 종단 검증 전에는 production 합격으로
-판정하지 않는다.
+    subgraph Compute["GPU training node"]
+        Worker["Worker Agent"]
+        Runtime["Pinned RVC runtime"]
+        Workspace["Attempt-private workspace"]
+        Worker --> Runtime
+        Runtime --> Workspace
+    end
 
-2026-07-13 dev.20 source의 전체 `make check`는 Python `752 passed, 4 deselected`, strict mypy
-88 source files, Web 24 files/211 tests, Ruff, ESLint와 Next.js production build를 통과했다.
-Localhost HTTP E2E는 승인된 socket 환경에서 `4 passed in 6.68s`였다. Maintenance/installer/migration
-결합 회귀는 `124 passed`, 실제 PostgreSQL 16 role/function/negative/dry-run smoke와 Redis 7.4,
-MinIO, secret projection 및 전체 Manager Compose smoke가 PASS했고 Alembic head는
-`f5d1c8a9b240`이다. dev.20은 외부 checksum, 내부 exact ledger, image closure, load 뒤 identity와
-release image 전체 Compose smoke까지 PASS했다. 이 dev.20 runtime smoke는 arm64 Colima의 amd64
-emulation 증거이며 clean Ubuntu x86_64 native 인수는 아니다. dev.20 archive의 40-hex source commit,
-clean-tree/source closure와 tracked revision의 `git diff --check`는 검증됐다.
+    Worker -->|"claim · heartbeat · status · telemetry"| API
+    API -->|"lease-bound Job snapshot"| Worker
+    Worker <-->|"verified Dataset / Artifact transfer"| Storage
+```
 
-같은 날짜의 현재 `a7c4e9f2b610` checkout은 `make check`에서 Ruff, strict mypy `91 source files`,
-Python `859 passed, 4 deselected`, Web `26 files/223 tests`, ESLint, Next.js 19 page build, shell syntax와
-`git diff --check`를 통과했다. 별도 localhost Manager↔Fake Worker HTTP E2E는 `4 passed in 7.18s`다.
-이는 최신 source 중앙 기능 증거이며 새 self-contained archive나 실제 NVIDIA/RVC 학습 증거는 아니다.
-정확한 SHA-256, 선행 image 준비와 현재 가능한 시험 범위는
-[설치 가이드](docs/INSTALLATION_GUIDE.md)에서 먼저 확인한다.
+### 구성 요소
+
+| 구성 요소 | 역할 | 하지 않는 일 |
+|---|---|---|
+| **Manager API** | 인증, Dataset/Experiment/Job 원장, lease, 업로드 검증, 상태 전이와 audit | RVC 학습 명령 실행 |
+| **Dashboard** | Dataset/Job/Worker 관측, Experiment 비교, Sample 재생, 사용자·모델 관리 | 사용자 token을 외부 object endpoint로 전달 |
+| **Worker Agent** | GPU 상태 보고, 작업 claim, RVC stage 실행, telemetry spool, Artifact 업로드 | PostgreSQL/Redis에 직접 접근 |
+| **RVC adapter** | pinned RVC source를 typed argv로 실행하고 v1/v2 산출물을 정규화 | shell 문자열 실행, stage 자동 재실행 |
+| **PostgreSQL** | 권한, 상태, attempt, checksum과 idempotency의 authoritative ledger | 대형 binary 저장 |
+| **MinIO/S3** | Dataset, TestSet, Artifact와 Sample의 canonical byte 저장 | 검증 없이 object를 완료 상태로 승격 |
+| **Redis/RQ** | 중앙 maintenance queue와 rate limit | 외부 Worker 작업 배정 |
+| **MLflow** | 완료된 실행의 durable 파생 projection | Model Registry의 승인 원장 역할 |
+
+## 작업이 흘러가는 방식
+
+1. **Dataset 등록**
+
+   사용자가 archive를 업로드하면 Manager가 MIME, 크기, 압축 경로, symlink, 중복과 압축 폭탄을
+   검사한다. 현재 지원하는 PCM WAV는 안전한 이름의 flat Dataset으로 준비하고 품질 지표를 계산한다.
+
+2. **Experiment와 Job 생성**
+
+   Dataset에 immutable Experiment를 결박하고 학습 설정을 선택한다. Job 생성 시 기본값까지 채운
+   canonical `JobConfig` JSON과 SHA-256을 같은 transaction에 저장한다.
+
+3. **원자적 작업 배정**
+
+   capability가 맞는 Worker 하나가 Job을 claim한다. Manager는 Job과 attempt에 같은 설정 hash를
+   복제하고 lease를 발급하며, Worker는 workspace를 만들기 전에 wire payload를 다시 검증한다.
+
+4. **격리된 RVC 실행**
+
+   Worker는 attempt 전용 workspace와 검증된 read-only RVC projection을 사용한다. preprocess, F0,
+   feature, training, index와 선택적 sample stage는 인자 배열로 실행되며 같은 stage를 자동 재실행하지
+   않는다.
+
+5. **관측 정보 전송**
+
+   로그와 metric sequence는 각각 0부터 증가하고 Worker의 local spool에 먼저 기록된다. Manager 장애
+   중에도 순서를 보존하며, terminal status는 log/metric watermark와 함께 attempt를 봉인한다.
+
+6. **산출물 게시와 완료 판정**
+
+   Worker가 Artifact upload session으로 byte를 전송하면 Manager가 전체 크기와 SHA-256을 다시 확인해
+   canonical object로 게시한다. 필수 model/index/sample과 현재 lease·attempt·config hash가 모두
+   일치해야 Job을 완료할 수 있다.
+
+7. **비교와 승인**
+
+   Dashboard에서 설정, 지표와 같은 TestSet item의 Sample을 비교한다. Model Registry는 실제
+   `rvc_webui` 완료 attempt와 승인된 runtime provenance에 결박된 canonical model/index만 후보로
+   받아 `candidate → approved → revoked` 원장을 유지한다.
+
+## 주요 기능
+
+아래 상태는 구현 유무와 production qualification을 구분한다.
+
+- **구현·회귀 검증**: source test 또는 fixture/E2E로 계약이 검증됐다.
+- **부분 검증**: 핵심 구현은 있으나 실제 browser, GPU, 외부 storage 또는 clean-host 증거가 남아 있다.
+- **출시 차단**: 구현 flag가 아니라 별도 runtime/운영 증적이 충족돼야 열린다.
+
+| 영역 | 현재 제공 범위 | 상태 |
+|---|---|---|
+| 사용자 인증 | bootstrap admin, JWT/session, RBAC, 사용자 lifecycle, token version 폐기 | 구현·회귀 검증 |
+| Worker 인증 | 별도 token, 2단계 회전, 관리자 폐기, inactive identity 재등록 | 구현·회귀 검증 |
+| Dataset | bounded upload, canonical flat ZIP, WAV 검증, PCM/LUFS 품질 집계 | 부분 검증 |
+| Job orchestration | immutable config hash, atomic claim, lease/heartbeat, retry/recovery fence | 구현·회귀 검증 |
+| Telemetry | durable spool, log/metric idempotency, terminal watermark, GPU/disk snapshot | 부분 검증 |
+| Artifact data plane | conditional upload, full-byte 검증, canonical publication, 이중 cleanup | 구현·회귀 검증 |
+| TestSet/Sample | immutable TestSet, lease-bound 수신, Sample 등록·재생·A/B 비교 | 부분 검증 |
+| Experiment | immutable name/Dataset, description CAS, 참조 안전 삭제, Run 비교 | 부분 검증 |
+| Model Registry | candidate/approved/revoked, active champion 0/1, rollback promotion | 부분 검증 |
+| MLflow | retry 가능한 durable outbox 기반 projection | 구현·회귀 검증 |
+| 설치·운영 | 분리 bundle, backup/restore/rollback, checksum/image closure | 부분 검증 |
+| Native GPU/Sample | guarded adapter와 qualification binding | 출시 차단 |
+
+세부 항목의 authoritative 상태는 [CHECKLIST.md](CHECKLIST.md), 요구사항별 인수 조건은
+[docs/REQUIREMENTS_TRACEABILITY.md](docs/REQUIREMENTS_TRACEABILITY.md)를 따른다.
+
+## RVC 지원 범위
+
+| 구분 | 지원 범위 | 비고 |
+|---|---|---|
+| RVC version | `v1`, `v2` | `v3`는 현재 지원하지 않는다. |
+| Feature directory | v1 `3_feature256`, v2 `3_feature768` | version 의미를 보존한다. |
+| 학습 F0 | `pm`, `harvest`, `dio`, `rmvpe`, `rmvpe_gpu` | `rmvpe_gpu`는 visible GPU capability가 필요하다. |
+| Sample inference F0 | `pm`, `harvest`, `crepe`, `rmvpe` | 학습 전용 방식과 별도 계약이다. |
+| 배포 모델 | `weights/<experiment>.pth` 또는 공식 checkpoint 추출 결과 | `G_*.pth`를 small model로 복사하지 않는다. |
+| 체크포인트 | `logs/<experiment>/G_*.pth`, `D_*.pth` | pair와 epoch 의미를 보존한다. |
+| 최종 인덱스 | `added_*.index` → `index/final.index` | 원본 이름과 checksum을 metadata에 남긴다. |
+| 보조 feature | `total_fea.npy` | 최종 index와 별도 Artifact다. |
+| Runtime 후보 lock | Torch `2.6.0+cu124`, Torchvision `0.21.0+cu124`, Torchaudio `2.6.0+cu124`, CUDA `12.4` | 후보 조합이며 아직 release qualification 전이다. |
+
+`auto_inference_samples.enabled=true`일 때 index를 만들지 않으면 `index_rate`는 반드시 `0`이어야 한다.
+없는 index나 승인되지 않은 runtime으로 조용히 fallback하지 않는다. 자세한 호환성 및 출시 gate는
+[RVC runtime matrix](docs/RVC_RUNTIME_MATRIX.md)와
+[runtime qualification](docs/RUNTIME_QUALIFICATION.md)을 참고한다.
+
+## 안전성과 재현성
+
+이 프로젝트는 “실행됐다”는 선언보다 “어떤 입력과 실행 환경으로 어떤 byte를 만들었는가”를 증명하는
+쪽에 무게를 둔다.
+
+| 원칙 | 보장하는 내용 |
+|---|---|
+| Manager/Worker 분리 | 제어 평면 침해가 곧바로 중앙 서버의 학습 명령 실행으로 이어지지 않게 한다. |
+| 인증 흐름 분리 | 사용자 JWT와 Worker token을 서로 대체할 수 없고 원문 credential을 DB/로그에 남기지 않는다. |
+| Immutable JobConfig | Job, attempt와 claim이 같은 canonical config SHA-256을 사용하며 active write마다 다시 확인한다. |
+| 단일 active lease | 한 Job을 동시에 여러 Worker가 학습하지 않도록 claim·renew·terminal 전이를 원자화한다. |
+| Canonical byte 검증 | Worker가 올린 URI를 신뢰하지 않고 Manager가 size/SHA-256을 재검증한 뒤 완료한다. |
+| 경로·프로세스 격리 | archive traversal/symlink escape를 차단하고 RVC를 shell 없이 attempt workspace에서 실행한다. |
+| Telemetry watermark | terminal 뒤 허용할 late batch의 정확한 상한을 attempt별로 보존한다. |
+| 최소 권한 runtime | API/Web/Worker는 non-root, MLflow는 고정 UID/GID와 read-only rootfs를 유지한다. |
+| Evidence-gated capability | GPU/Sample capability는 env boolean이 아니라 승인된 qualification archive로만 활성화한다. |
+
+구체적인 threat boundary와 운영 기본값은 [보안 문서](docs/SECURITY.md), 서비스 경계와 불변 조건은
+[아키텍처 문서](docs/ARCHITECTURE.md)에 있다.
+
+## 현재 출시 상태
+
+### 한눈에 보기
+
+| 대상 | 현재 상태 | 가능한 것 | 아직 의미하지 않는 것 |
+|---|---|---|---|
+| 최신 source | `a7c4e9f2b610` schema head | Manager/API/Web/DB와 Fake Worker 기능 검증 | 새 self-contained 설치 archive |
+| dev.20 Manager | `SELF_CONTAINED=true` 개발 후보 | 정확한 8개 linux/amd64 image의 설치·Compose 시험 | clean Ubuntu production 인수 |
+| dev.20 Worker | `SELF_CONTAINED=false` partial archive | 구성·보호 gate 시험 | native GPU 학습 또는 offline 설치 |
+| Native Sample | capability disabled | fixture 기반 publication/completion 계약 시험 | 실제 CREPE/GPU Sample qualification |
+
+### 구현된 핵심 경계
+
+- 인증·원장, Dataset/Artifact data plane과 lease 기반 Worker protocol
+- 실시간 Dashboard, MLflow durable projection과 immutable Experiment/TestSet/Preset/Sample 관계
+- JobConfig canonical hash의 Job → attempt → claim → terminal/Artifact/Sample 전 구간 결박
+- Dataset/TestSet/Artifact upload token, heartbeat, absolute deadline과 확인형 cleanup
+- Worker token 회전·폐기, 관리자 사용자 lifecycle과 이전 access token 영구 fencing
+- 실험 비교, 검증된 Sample range streaming과 Model Registry 승인 원장
+- Manager/Worker bundle builder, strict checksum inventory, image identity, backup/restore/rollback
+
+### 남은 주요 release gate
+
+- multipart/resume upload와 격리된 non-WAV decoder
+- Dataset finalize/retention maintenance의 남은 범위
+- 실제 CREPE weight 출처·라이선스·SHA-256 승인
+- reviewed amd64 base digest와 Torch/CUDA runtime의 전체 49-case GPU/no-network matrix
+- PostgreSQL multi-replica 경쟁, 외부 MinIO/S3 대용량·tamper·outage와 장기 PUT 장애 주입
+- 실제 browser의 Experiment/User/Registry 응답 유실, 반응형, keyboard와 screen-reader 인수
+- 외부 TLS 종단, custom CA, clean Ubuntu 22.04/24.04 및 NVIDIA GPU 설치 smoke
+- 완전한 SBOM, 취약점·container·secret scan과 법적 license review
+
+현재 production Agent는 증적 없이 `fixed_test_set_inference_ready` 또는 auto-sample capability를 열 수
+없다. 전체 진행률과 미완료 항목은 [개발 체크리스트](CHECKLIST.md)에만 판정한다.
+
+## 개발 시작
+
+### 준비 환경
+
+- Python `3.11`
+- Node.js `20.9` 이상
+- npm lockfile 기준 의존성
+- Docker/Compose는 별도 infra·installer smoke를 실행할 때만 필요
+- 실제 native Worker 검증에는 지원 NVIDIA host와 별도 runtime qualification 입력이 필요
+
+### 1. 개발 의존성 설치
+
+```bash
+make bootstrap
+```
+
+이 명령은 `.venv`를 만들고 Python 개발 의존성을 설치한 뒤 `apps/web`에서 `npm ci`를 실행한다.
+최초 실행은 Python/NPM registry 접근 또는 사전 준비한 cache가 필요하다.
+
+### 2. 기본 source 검증
+
+```bash
+make check
+```
+
+`make check`는 Ruff, strict mypy, Python unit/integration test, Web Vitest/ESLint/production build,
+shell 문법과 Git whitespace를 검사한다. 다음 항목은 포함하지 않는다.
+
+- localhost socket을 사용하는 Manager↔Fake Worker HTTP E2E
+- Docker image build와 Compose service 기동/health
+- 실제 installer 실행과 volume recovery drill
+- NVIDIA GPU 또는 native RVC 학습
+
+### 3. localhost protocol E2E
+
+```bash
+make test-e2e
+```
+
+임시 SQLite, 실제 localhost Uvicorn과 명시적으로 opt-in한 Fake Worker를 사용해 Dataset → Job claim →
+telemetry → Artifact → completion 흐름을 검증한다. 이 테스트의 GPU와 RVC event는 fixture이므로 실제
+NVIDIA/RVC 정확도 증거가 아니다.
+
+Docker, installer, migration, data plane과 runtime별 세부 명령은 [자동 테스트 문서](docs/TESTING.md),
+사용자 실행 순서와 합격 증적은 [테스트 가이드](docs/TEST_GUIDE.md)를 따른다.
+
+## 저장소 구조
+
+```text
+.
+├── apps/
+│   ├── api/                 # FastAPI Manager와 Alembic migration
+│   ├── web/                 # Next.js Dashboard와 same-origin BFF
+│   └── worker/              # GPU Worker Agent와 RVC adapter
+├── packages/contracts/      # Manager↔Worker 공유 wire/domain contract
+├── infra/                   # Compose, runtime projection과 qualification 도구
+├── installers/              # Manager/Worker Linux bundle builder와 lifecycle script
+├── tests/                   # E2E, infra, installer와 recovery 검증
+├── docs/                    # 아키텍처·설치·운영·시험·보안 문서와 ADR
+├── CHECKLIST.md             # 구현 및 인수 상태의 authoritative checklist
+└── AGENTS.md                # 사람과 자동화 agent의 공통 작업 규칙
+```
+
+## 검증된 개발 설치 번들
+
+dev.20 archive는 source commit `298ee1ec112cc7dc3a55d8374bba8c9e38f9f55a`와 Manager schema head
+`f5d1c8a9b240`에 결박된 **역사적 개발 산출물**이다.
+
+| Bundle | 크기 | 성격 |
+|---|---:|---|
+| `rvc-manager-0.1.0-dev.20-linux-amd64.tar.gz` | `667,617,422` byte | 8개 linux/amd64 image를 포함한 self-contained Manager 후보 |
+| `rvc-worker-0.1.0-dev.20-linux-amd64.tar.gz` | `108,488` byte | runtime image가 없는 partial Worker archive |
+
+```text
+Manager SHA-256  c6488dad47c7f38c082ed6fa68f1fe3691c069110aef0bbf68a9d7ba5e6f5b70
+Worker SHA-256   7f36cbf27100bf70425c2780142d4fa3f6e6e76d0acf410d3e3fb698aa50558b
+```
+
+각 archive의 sidecar `.sha256`, 내부 `SHA256SUMS` exact inventory와 image manifest v2가 검증됐다.
+Manager는 image 포함 기능 시험에 사용할 수 있지만, Worker는 image/runtime/GPU/profile/Sample gate가
+모두 비어 있거나 false다. 둘을 air-gapped production release 또는 `v1.0.0`으로 표현하면 안 된다.
+
+> [!WARNING]
+> 현재 checkout의 schema head는 dev.20보다 새로운 `a7c4e9f2b610`이다. `config_sha256`이 Job claim의
+> 필수 wire field가 됐으므로 현재 Manager/Worker source는 같은 새 release로 배포해야 한다. dev.20
+> Worker를 현재 Manager source와 혼용하거나 기존 archive를 새 source 설치 파일로 재표시하지 않는다.
+
+<details>
+<summary><strong>dev.12 → dev.20 개발 번들 변화 요약</strong></summary>
+
+- **dev.12** — runtime secret projection, exact MinIO policy, authoritative engine mode와 Fake 경고
+- **dev.13** — Dataset integrated LUFS, strict release file/environment closure, bundle-local 문서
+- **dev.14** — proxy foreground 실행, MinIO/MLflow loopback publish와 Manager Compose smoke
+- **dev.15** — source ignore closure, Docker config digest, forward-only upgrade와 실패 전파
+- **dev.16** — physical release runbook, overlay lock, Manager release orchestrator와 readiness report
+- **dev.17** — Experiment 비교, Worker custom CA와 공통 strict SSL context
+- **dev.18** — Model Registry 원장/API/BFF/UI와 migration
+- **dev.19** — maintenance 전용 PostgreSQL/Redis/S3 identity와 장기 cleanup heartbeat
+- **dev.20** — clean committed source 기반 정확한 8-image linux/amd64 Manager closure
+
+dev.15 이하에는 현재 runbook·custom CA 보정 또는 code guard가 부족하므로 새 설치·시험 기준으로
+사용하지 않는다. 상세 결정과 검증 근거는 [개발 이력](docs/DEVELOPMENT_HISTORY.md)에 남아 있다.
+
+</details>
+
+## 최근 검증 기준선
+
+검증 숫자는 해당 revision의 역사적 증거이며, 이후 실행이 같은 개수여야 한다는 뜻은 아니다.
+
+| 기준선 | 확인된 결과 | 한계 |
+|---|---|---|
+| dev.20 committed source | Python `752 passed, 4 deselected`, mypy 88 files, Web 24 files/211 tests, HTTP E2E 4 passed | archive와 일치하는 과거 revision |
+| dev.20 Manager runtime | PostgreSQL 16, Redis 7.4, MinIO, MLflow, secret projection, 8-image Compose smoke PASS | arm64 Colima의 amd64 emulation |
+| 현재 `a7c4e9f2b610` source | Python `859 passed, 4 deselected`, mypy 91 files, Web 26 files/223 tests, 19-page build, HTTP E2E 4 passed | 새 self-contained archive와 실제 GPU 증거 아님 |
+
+마지막 전체 source 검증일은 `2026-07-13`이다. 실행 명령, warning, 제외 항목과 환경을 포함한 원문
+증거는 [테스트 문서](docs/TESTING.md)와 [개발 이력](docs/DEVELOPMENT_HISTORY.md)을 확인한다.
+
+## 문서 지도
+
+### 처음 읽는 순서
+
+1. [AGENTS.md](AGENTS.md) — 저장소 안전 규칙과 작업 전·후 의무
+2. [CHECKLIST.md](CHECKLIST.md) — 현재 단계, 검증된 항목과 남은 출시 gate
+3. [개발 이력](docs/DEVELOPMENT_HISTORY.md) — 직전 결정, 변경 파일, 검증 결과와 남은 위험
+4. [아키텍처](docs/ARCHITECTURE.md) — 서비스 경계, 상태 전이와 핵심 불변 조건
+5. [요구사항 추적표](docs/REQUIREMENTS_TRACEABILITY.md) — 요구사항 ID별 인수 조건과 상태
+
+### 목적별 안내
+
+| 하고 싶은 일 | 먼저 볼 문서 |
+|---|---|
+| Manager/Worker를 설치하고 싶다 | [설치 가이드](docs/INSTALLATION_GUIDE.md) |
+| 사용자 인수 시험을 실행하고 결과를 남기고 싶다 | [테스트 가이드](docs/TEST_GUIDE.md) · [결과 템플릿](docs/TEST_RESULT_TEMPLATE.md) |
+| 자동 test와 fixture 범위를 알고 싶다 | [테스트 상세](docs/TESTING.md) |
+| bundle을 만들거나 배포·업그레이드하고 싶다 | [배포 문서](docs/DEPLOYMENT.md) |
+| 장애, backup, restore와 일상 운영을 수행하고 싶다 | [운영 가이드](docs/OPERATIONS_GUIDE.md) |
+| RVC/Torch/CUDA 조합을 검토하고 싶다 | [RVC runtime matrix](docs/RVC_RUNTIME_MATRIX.md) · [upstream notes](docs/RVC_UPSTREAM_NOTES.md) |
+| 실제 GPU 결과로 capability를 열고 싶다 | [runtime qualification](docs/RUNTIME_QUALIFICATION.md) |
+| 인증·secret·network 경계를 검토하고 싶다 | [보안 문서](docs/SECURITY.md) |
+| SBOM과 license 증명 범위를 확인하고 싶다 | [supply-chain 문서](docs/SUPPLY_CHAIN.md) |
+| 주요 설계 결정을 확인하고 싶다 | [ADR-0001](docs/adr/0001-remote-worker-job-claim.md) · [ADR-0002](docs/adr/0002-canonical-dataset-preparation.md) · [ADR-0003](docs/adr/0003-installation-platform.md) · [ADR-0004](docs/adr/0004-fixed-testset-sample-provenance.md) |
+
+## 작업에 참여할 때
+
+코드나 문서를 바꾸기 전에 반드시 [AGENTS.md](AGENTS.md)를 읽고 `git status --short`로 다른 작업자의
+변경을 확인한다. 구현은 관련 요구사항 ID와 연결하고, 실제로 완료·검증한 항목만 CHECKLIST에서
+완료 처리한다.
+
+작업을 마칠 때는 다음을 함께 남긴다.
+
+- 변경 목적과 영향을 받은 파일
+- 핵심 결정과 보존해야 할 불변 조건
+- 실행한 검증 명령과 실제 결과
+- 아직 남은 위험과 production 인수에 포함되지 않는 범위
+
+모든 코드·구성·운영 변경은 [개발 이력](docs/DEVELOPMENT_HISTORY.md)의 최신 날짜 아래에 기록한다.
+설치·운영·테스트 흐름을 바꿨다면 관련 가이드와 요구사항 추적표도 같은 변경에서 갱신한다.

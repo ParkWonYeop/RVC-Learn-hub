@@ -2,6 +2,35 @@
 
 이 문서는 변경 사실뿐 아니라 그 이유, 검증 결과와 남은 위험을 후속 작업자에게 전달한다. 최신 날짜의 항목을 위에 추가하고, 같은 날짜 안에서는 최신 작업을 위에 둔다.
 
+## 2026-07-14
+
+### README 독자 흐름과 정보 계층 재구성
+
+**목적과 변경 범위**
+
+- 제품 설명, 아키텍처, 구현 상태, 개발 검증, 설치 bundle 증거와 문서 링크가 긴 문단에 섞여 있던
+  README를 처음 방문한 사용자, 개발자와 운영자가 각자 필요한 경로를 빠르게 찾도록 재구성했다.
+- 첫 화면에 production 미출시와 Fake 증거의 한계를 고정하고, Manager/Worker 분리 구조를 Mermaid로
+  시각화했다. Dataset 등록부터 Job snapshot, lease claim, RVC 실행, telemetry, canonical Artifact와
+  Model Registry까지의 흐름을 단계별로 설명했다.
+- 구현 상태 용어, RVC v1/v2·F0·산출물 의미, 핵심 안전 불변 조건, 개발 bootstrap/check/E2E 범위,
+  저장소 구조와 목적별 문서 지도를 각각 독립된 절로 분리했다. dev.20 checksum과 현재
+  `a7c4e9f2b610` source의 비호환 경고는 본문에 유지하고 dev.12~20 변화는 접기 영역으로 옮겼다.
+
+**변경 파일과 검증**
+
+- 변경: `README.md`, `docs/DEVELOPMENT_HISTORY.md`.
+- README의 링크 39개를 검사해 repository 상대 경로에 누락이 없음을 확인했고 `git diff --check`도
+  통과했다. 코드, 공개 API, 환경 변수, 설치 명령 또는 runtime 동작은 바꾸지 않았으므로 전체
+  application test는 실행하지 않았고 CHECKLIST/요구사항 상태도 바꾸지 않았다.
+
+**남은 위험**
+
+- Mermaid, GitHub alert와 `<details>` 표현은 이를 지원하는 Markdown renderer에서 가장 잘 보인다.
+  텍스트와 표만 렌더링하는 환경에서도 핵심 정보와 링크는 유지된다.
+- README의 테스트 개수와 dev.20 checksum은 역사적 기준선이다. 향후 새 release archive 또는 전체
+  검증이 생기면 CHECKLIST, 설치·테스트 문서와 함께 이 요약도 갱신해야 한다.
+
 ## 2026-07-13
 
 ### Canonical JobConfig 전 구간 결박과 Artifact upload writer/finalizer/cleanup 수렴
